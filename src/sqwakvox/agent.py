@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import asyncio
 import logging
 import os
@@ -14,11 +15,124 @@ from any_agent import AgentConfig, AgentFramework, AnyAgent
 from any_agent import AnyAgent as AnyAgentLib
 from any_agent.config import MCPParams
 from jinja2 import Template
+from pydantic import BaseModel
 
 from sqwakvox.models import ModelProvider
 from sqwakvox.telemetry import trace_span
 
 logger = logging.getLogger(__name__)
+
+# Keys that carry human-readable payloads when an agent response arrives as a
+# Python/JSON object literal instead of plain text (see _unwrap_literal_text).
+_RESPONSE_PAYLOAD_KEYS = (
+    "chart",
+    "output",
+    "text",
+    "content",
+    "response",
+    "answer",
+    "result",
+)
+
+
+def _unwrap_literal_text(text: str) -> str:
+    """Recover human-readable text when a response is (or embeds) a literal.
+
+    Two real-world failure modes produce a Python-object-looking blob instead
+    of the actual answer / ASCII chart:
+
+    * the ``mcp-ascii-charts`` MCP server returns ``{"chart": ..., "title":
+      ...}`` and models frequently echo that structured object verbatim into
+      their final answer;
+    * any_agent's langchain adapter does ``str(last_message.content)``, which
+      turns a content-block list into its Python repr.
+
+    ``ast.literal_eval`` accepts both JSON (double-quoted) and Python-repr
+    forms, so the embedded text can be recovered without a JSON decoder.
+    """
+    stripped = text.strip()
+    if stripped.startswith(("{", "[")):
+        try:
+            obj = ast.literal_eval(stripped)
+        except (ValueError, SyntaxError):
+            return text
+        return _extract_response(obj)
+
+    # Object embedded in prose (e.g. "Here is the chart:\n{'chart': '...'}"):
+    # find the outermost balanced {...} span and unwrap it if it carries a
+    # text payload.  Anything else is returned untouched.
+    start = text.find("{")
+    if start == -1:
+        return text
+    depth = 0
+    for idx in range(start, len(text)):
+        if text[idx] == "{":
+            depth += 1
+        elif text[idx] == "}":
+            depth -= 1
+            if depth == 0:
+                candidate = text[start : idx + 1]
+                try:
+                    obj = ast.literal_eval(candidate)
+                except (ValueError, SyntaxError):
+                    return text
+                if isinstance(obj, dict) and any(k in obj for k in _RESPONSE_PAYLOAD_KEYS):
+                    prefix = text[:start].rstrip()
+                    suffix = text[idx + 1 :].strip()
+                    extracted = _extract_response(obj)
+                    if extracted:
+                        return f"{prefix}\n{extracted}\n{suffix}".strip()
+                return text
+    return text
+
+
+def _extract_response(final_output: Any) -> str:
+    """Best-effort plain-text extraction from any_agent's ``final_output``.
+
+    ``final_output`` is typed ``str | dict | BaseModel | None``; a naive
+    ``str()`` on a dict/BaseModel leaks a Python object repr into the
+    user-facing response — an ascii-chart answer arrives as ``{'chart':
+    '...'}`` instead of the chart itself.
+    """
+    if final_output is None:
+        return ""
+    if isinstance(final_output, str):
+        return _unwrap_literal_text(final_output)
+    if isinstance(final_output, BaseModel):
+        # LangChain messages (AIMessage & co) are pydantic models.
+        content = getattr(final_output, "content", None)
+        if content is not None:
+            return _extract_response(content)
+        return str(final_output)
+    if isinstance(final_output, dict):
+        for key in _RESPONSE_PAYLOAD_KEYS:
+            value = final_output.get(key)
+            if isinstance(value, str):
+                return _unwrap_literal_text(value)
+        messages = final_output.get("messages")
+        if isinstance(messages, list) and messages:
+            return _extract_response(messages[-1])
+        return str(final_output)
+    if isinstance(final_output, list):
+        # Content blocks: [{"type": "text", "text": "..."}]
+        parts: list[str] = []
+        for item in final_output:
+            if isinstance(item, dict):
+                for key in ("text", "content", "chart"):
+                    value = item.get(key)
+                    if isinstance(value, str):
+                        parts.append(value)
+                        break
+            elif isinstance(item, str):
+                parts.append(item)
+        if parts:
+            return _unwrap_literal_text("\n".join(parts))
+        return str(final_output)
+    content = getattr(final_output, "content", None)
+    if content is not None:
+        return _extract_response(content)
+    return str(final_output)
+
 
 # Conversation memory lives in a dedicated Redis logical DB, separate from the
 # Celery broker (db 0) and result backend (db 1).  Override if needed.
@@ -303,7 +417,10 @@ class AnyAgentOrchestrator:
                     timeout=AGENT_RUN_TIMEOUT_SECONDS,
                 )
                 elapsed = time.monotonic() - start_time
-                response = str(trace.final_output)
+                # final_output is str | dict | BaseModel | None — unwrap it so
+                # structured/chart payloads don't leak Python object reprs
+                # into the user-facing response (see _extract_response).
+                response = _extract_response(trace.final_output)
                 span.set_attribute("response_len", len(response))
                 span.set_attribute("elapsed_sec", elapsed)
                 span.set_attribute("trace_spans_count", len(trace.spans))
