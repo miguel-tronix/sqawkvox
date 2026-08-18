@@ -19,3 +19,7 @@ sqwakvox_telemetry.jsonl
 # Celery beat runtime artifacts
 celerybeat-schedule
 celerybeat.pid
+
+# Node modules
+
+node_modules/*
