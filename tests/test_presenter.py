@@ -173,7 +173,11 @@ async def test_poll_timeout_marks_failure_without_hanging() -> None:
     """
     presenter = Presenter()
     try:
-        result = AsyncResult("nonexistent-task-id")
+        result = MagicMock(spec=AsyncResult)
+        result.id = "nonexistent-task-id"
+        result.ready.return_value = False
+        result.state = "PENDING"
+
         handle = TaskHandle(task_id="nonexistent-task-id", task_name="convert_document")
         errors: list[str] = []
         await presenter._poll(
