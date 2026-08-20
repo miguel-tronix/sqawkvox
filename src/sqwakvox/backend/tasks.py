@@ -113,7 +113,7 @@ def execute_agent(
     data_store: dict[str, str],
     mcp_servers: list[dict[str, Any]] | None,
     thread_id: str | None = None,
-) -> dict[str, Any]:
+) -> dict[str, Any] | AgentResult:
     """Execute the LLM agent for a user chat query.
 
     ``mcp_servers`` is a broker-safe ``model_dump()`` list of any_agent MCP

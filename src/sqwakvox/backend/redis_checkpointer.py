@@ -74,8 +74,8 @@ def _sanitize_for_serde(obj: Any, depth: int = 0) -> Any:
                 val = getattr(obj, attr)
                 if val is not None:
                     kwargs[attr] = _sanitize_for_serde(val, depth + 1)
-        if hasattr(obj, "tool_calls") and getattr(obj, "tool_calls"):
-            kwargs["tool_calls"] = _sanitize_for_serde(getattr(obj, "tool_calls"), depth + 1)
+        if hasattr(obj, "tool_calls") and obj.tool_calls:
+            kwargs["tool_calls"] = _sanitize_for_serde(obj.tool_calls, depth + 1)
         return obj.__class__(**kwargs)
     if isinstance(obj, dict):
         return {str(k): _sanitize_for_serde(v, depth + 1) for k, v in obj.items()}
@@ -89,7 +89,7 @@ def _sanitize_for_serde(obj: Any, depth: int = 0) -> Any:
         JsonPlusSerializer().dumps_typed(obj)
         return obj
     except Exception:
-        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+        if hasattr(obj, "model_dump") and callable(obj.model_dump):
             try:
                 dumped = obj.model_dump()
                 return _sanitize_for_serde(dumped, depth + 1)

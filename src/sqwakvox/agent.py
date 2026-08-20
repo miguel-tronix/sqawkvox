@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -15,14 +16,12 @@ from any_agent import AgentConfig, AgentFramework, AnyAgent
 from any_agent import AnyAgent as AnyAgentLib
 from any_agent.config import MCPParams
 from jinja2 import Template
-from pydantic import BaseModel
 
 from sqwakvox.models import ModelProvider
 from sqwakvox.telemetry import trace_span
 
 logger = logging.getLogger(__name__)
 
-import json
 
 # Keys that carry human-readable payloads when an agent response arrives as a
 # Python/JSON object literal instead of plain text (see _unwrap_literal_text).
