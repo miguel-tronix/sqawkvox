@@ -1,10 +1,91 @@
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from any_agent import AgentConfig
+from langchain_core.messages import AIMessage
 
-from sqwakvox.agent import AnyAgentOrchestrator
+from sqwakvox.agent import AnyAgentOrchestrator, _extract_response
 from sqwakvox.models import ModelProvider
+
+CHART_TEXT = (
+    "Cash Flow From Operating Activities\n"
+    "2022  ████████████████████ 124.0\n"
+    "2023  ████████████████████████ 158.0"
+)
+
+
+def test_extract_response_plain_str_passthrough() -> None:
+    assert _extract_response(CHART_TEXT) == CHART_TEXT
+
+
+def test_extract_response_python_repr_object() -> None:
+    """Model echoes the mcp-ascii-charts JSON object as a Python repr."""
+    payload = repr({"chart": CHART_TEXT, "title": "t", "dimensions": {"width": 60}})
+    out = _extract_response(payload)
+    assert out == CHART_TEXT
+    assert "'chart'" not in out
+
+
+def test_extract_response_json_object() -> None:
+    payload = json.dumps({"chart": CHART_TEXT, "title": "t"})
+    assert _extract_response(payload) == CHART_TEXT
+
+
+def test_extract_response_prose_with_embedded_object() -> None:
+    payload = "Here is the chart:\n" + repr({"chart": CHART_TEXT}) + "\nHope that helps!"
+    out = _extract_response(payload)
+    assert CHART_TEXT in out
+    assert "'chart'" not in out
+
+
+def test_extract_response_content_block_list_repr() -> None:
+    """any_agent's str(content) leak for content-block lists is recoverable."""
+    payload = repr([{"type": "text", "text": "Here:\n" + CHART_TEXT}])
+    out = _extract_response(payload)
+    assert "Here:" in out
+    assert CHART_TEXT in out
+    assert "{'type'" not in out
+
+
+def test_extract_response_output_dict() -> None:
+    assert _extract_response({"output": "chart answer"}) == "chart answer"
+
+
+def test_extract_response_messages_dict() -> None:
+    payload = {"messages": [{"type": "ai", "content": CHART_TEXT}]}
+    assert _extract_response(payload) == CHART_TEXT
+
+
+def test_extract_response_aimessage_object() -> None:
+    assert _extract_response(AIMessage(content=CHART_TEXT)) == CHART_TEXT
+
+
+def test_extract_response_none() -> None:
+    assert _extract_response(None) == ""
+
+
+def test_extract_response_prose_untouched() -> None:
+    prose = "Revenue grew 12% year over year."
+    assert _extract_response(prose) == prose
+
+
+def test_extract_response_json_with_lowercase_boolean() -> None:
+    payload = '{"chart": "A ███ 10", "title": "Sales", "success": true}'
+    out = _extract_response(payload)
+    assert out == "A ███ 10"
+
+
+def test_extract_response_embedded_json_with_boolean() -> None:
+    payload = 'Here is chart:\n{"chart": "A ███ 10", "success": true}\nHope it helps!'
+    out = _extract_response(payload)
+    assert out == "Here is chart:\nA ███ 10\nHope it helps!"
+
+
+def test_extract_response_nested_chart_dict() -> None:
+    payload = {"chart": {"text": "A ███ 10", "title": "Sales"}}
+    out = _extract_response(payload)
+    assert out == "A ███ 10"
 
 
 def test_model_provider_supports_system_role() -> None:
@@ -155,3 +236,27 @@ def test_gemini_provider_patch_converts_function_role_to_user() -> None:
     formatted_messages, _ = gemini_utils._convert_messages(test_messages)
     for msg in formatted_messages:
         assert msg.role in ("user", "model"), f"Role {msg.role} is not supported by Gemini API!"
+
+
+def test_redis_checkpointer_sanitizes_non_packable_aimessage() -> None:
+    from sqwakvox.backend.redis_checkpointer import RedisCheckpointer
+
+    class UnpackableObj:
+        def __repr__(self) -> str:
+            return "<UnpackableObj>"
+
+    msg = AIMessage(
+        content="Chart result",
+        response_metadata={"raw_client": UnpackableObj()},
+        additional_kwargs={"extra": UnpackableObj()},
+    )
+
+    checkpointer = RedisCheckpointer("redis://localhost:6379/2")
+    raw_dump = checkpointer._dumps(msg)
+    assert isinstance(raw_dump, str)
+
+    loaded_msg = checkpointer._loads(raw_dump)
+    assert isinstance(loaded_msg, AIMessage)
+    assert loaded_msg.content == "Chart result"
+    assert loaded_msg.response_metadata["raw_client"] == "<UnpackableObj>"
+    assert loaded_msg.additional_kwargs["extra"] == "<UnpackableObj>"
