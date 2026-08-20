@@ -577,7 +577,17 @@ class SqwakvoxApp(App[None]):
         """
         from rich.text import Text
 
-        assembled = Text.assemble(Text.from_markup(label_markup), Text.from_ansi(body))
+        try:
+            label_text = Text.from_markup(label_markup)
+        except Exception:
+            label_text = Text(label_markup)
+
+        try:
+            body_text = Text.from_ansi(body)
+        except Exception:
+            body_text = Text(body)
+
+        assembled = Text.assemble(label_text, body_text)
 
         def _write() -> None:
             chat_log = self.query_one("#chat-log", RichLog)

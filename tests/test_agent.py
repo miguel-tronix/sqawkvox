@@ -70,6 +70,24 @@ def test_extract_response_prose_untouched() -> None:
     assert _extract_response(prose) == prose
 
 
+def test_extract_response_json_with_lowercase_boolean() -> None:
+    payload = '{"chart": "A ███ 10", "title": "Sales", "success": true}'
+    out = _extract_response(payload)
+    assert out == "A ███ 10"
+
+
+def test_extract_response_embedded_json_with_boolean() -> None:
+    payload = 'Here is chart:\n{"chart": "A ███ 10", "success": true}\nHope it helps!'
+    out = _extract_response(payload)
+    assert out == "Here is chart:\nA ███ 10\nHope it helps!"
+
+
+def test_extract_response_nested_chart_dict() -> None:
+    payload = {"chart": {"text": "A ███ 10", "title": "Sales"}}
+    out = _extract_response(payload)
+    assert out == "A ███ 10"
+
+
 def test_model_provider_supports_system_role() -> None:
     assert ModelProvider.supports_system_role("gemini:gemini-3.6-flash") is False
     assert ModelProvider.supports_system_role("gemini:gemini-3.5-flash") is True
@@ -218,3 +236,27 @@ def test_gemini_provider_patch_converts_function_role_to_user() -> None:
     formatted_messages, _ = gemini_utils._convert_messages(test_messages)
     for msg in formatted_messages:
         assert msg.role in ("user", "model"), f"Role {msg.role} is not supported by Gemini API!"
+
+
+def test_redis_checkpointer_sanitizes_non_packable_aimessage() -> None:
+    from sqwakvox.backend.redis_checkpointer import RedisCheckpointer
+
+    class UnpackableObj:
+        def __repr__(self) -> str:
+            return "<UnpackableObj>"
+
+    msg = AIMessage(
+        content="Chart result",
+        response_metadata={"raw_client": UnpackableObj()},
+        additional_kwargs={"extra": UnpackableObj()},
+    )
+
+    checkpointer = RedisCheckpointer("redis://localhost:6379/2")
+    raw_dump = checkpointer._dumps(msg)
+    assert isinstance(raw_dump, str)
+
+    loaded_msg = checkpointer._loads(raw_dump)
+    assert isinstance(loaded_msg, AIMessage)
+    assert loaded_msg.content == "Chart result"
+    assert loaded_msg.response_metadata["raw_client"] == "<UnpackableObj>"
+    assert loaded_msg.additional_kwargs["extra"] == "<UnpackableObj>"

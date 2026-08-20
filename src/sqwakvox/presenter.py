@@ -22,7 +22,7 @@ import contextlib
 import logging
 import os
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import StrEnum
 from typing import Any
 
@@ -267,7 +267,9 @@ class Presenter:
         def _on_complete(status: TaskStatus, payload: Any) -> None:
             if on_complete is not None:
                 if status == TaskStatus.SUCCESS and isinstance(payload, dict):
-                    on_complete(TaskStatus.SUCCESS, AgentResult(**payload))
+                    valid_keys = {f.name for f in fields(AgentResult)}
+                    filtered = {k: v for k, v in payload.items() if k in valid_keys}
+                    on_complete(TaskStatus.SUCCESS, AgentResult(**filtered))
                 else:
                     on_complete(status, payload)
 

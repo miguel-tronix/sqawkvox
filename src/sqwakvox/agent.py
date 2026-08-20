@@ -22,17 +22,37 @@ from sqwakvox.telemetry import trace_span
 
 logger = logging.getLogger(__name__)
 
+import json
+
 # Keys that carry human-readable payloads when an agent response arrives as a
 # Python/JSON object literal instead of plain text (see _unwrap_literal_text).
 _RESPONSE_PAYLOAD_KEYS = (
     "chart",
+    "ascii_chart",
+    "ascii",
+    "graph",
+    "diagram",
     "output",
     "text",
     "content",
     "response",
     "answer",
     "result",
+    "data",
 )
+
+
+def _parse_literal(val: str) -> Any:
+    """Parse string val as JSON or Python literal, returning None on failure."""
+    val_str = val.strip()
+    try:
+        return json.loads(val_str)
+    except Exception:
+        pass
+    try:
+        return ast.literal_eval(val_str)
+    except Exception:
+        return None
 
 
 def _unwrap_literal_text(text: str) -> str:
@@ -42,47 +62,51 @@ def _unwrap_literal_text(text: str) -> str:
     of the actual answer / ASCII chart:
 
     * the ``mcp-ascii-charts`` MCP server returns ``{"chart": ..., "title":
-      ...}`` and models frequently echo that structured object verbatim into
+      ...}`` or JSON/Python dict payloads that models frequently echo verbatim into
       their final answer;
     * any_agent's langchain adapter does ``str(last_message.content)``, which
       turns a content-block list into its Python repr.
 
-    ``ast.literal_eval`` accepts both JSON (double-quoted) and Python-repr
-    forms, so the embedded text can be recovered without a JSON decoder.
+    Tries both JSON and Python literal parsing to extract embedded chart payloads.
     """
     stripped = text.strip()
     if stripped.startswith(("{", "[")):
-        try:
-            obj = ast.literal_eval(stripped)
-        except (ValueError, SyntaxError):
-            return text
-        return _extract_response(obj)
+        parsed = _parse_literal(stripped)
+        if parsed is not None and parsed != text and not isinstance(parsed, str):
+            extracted = _extract_response(parsed)
+            if extracted:
+                return extracted
 
     # Object embedded in prose (e.g. "Here is the chart:\n{'chart': '...'}"):
-    # find the outermost balanced {...} span and unwrap it if it carries a
-    # text payload.  Anything else is returned untouched.
-    start = text.find("{")
-    if start == -1:
-        return text
-    depth = 0
-    for idx in range(start, len(text)):
-        if text[idx] == "{":
-            depth += 1
-        elif text[idx] == "}":
-            depth -= 1
-            if depth == 0:
-                candidate = text[start : idx + 1]
-                try:
-                    obj = ast.literal_eval(candidate)
-                except (ValueError, SyntaxError):
-                    return text
-                if isinstance(obj, dict) and any(k in obj for k in _RESPONSE_PAYLOAD_KEYS):
-                    prefix = text[:start].rstrip()
-                    suffix = text[idx + 1 :].strip()
-                    extracted = _extract_response(obj)
-                    if extracted:
+    # find balanced {...} or [...] spans and unwrap them if they carry a text payload.
+    for open_char, close_char in (("{", "}"), ("[", "]")):
+        pos = 0
+        while True:
+            start = text.find(open_char, pos)
+            if start == -1:
+                break
+            depth = 0
+            found_end = -1
+            for idx in range(start, len(text)):
+                if text[idx] == open_char:
+                    depth += 1
+                elif text[idx] == close_char:
+                    depth -= 1
+                    if depth == 0:
+                        found_end = idx
+                        break
+            if found_end != -1:
+                candidate = text[start : found_end + 1]
+                parsed = _parse_literal(candidate)
+                if parsed is not None and not isinstance(parsed, str):
+                    extracted = _extract_response(parsed)
+                    if extracted and extracted != candidate:
+                        prefix = text[:start].rstrip()
+                        suffix = text[found_end + 1 :].strip()
                         return f"{prefix}\n{extracted}\n{suffix}".strip()
-                return text
+                pos = start + 1
+            else:
+                break
     return text
 
 
@@ -98,17 +122,20 @@ def _extract_response(final_output: Any) -> str:
         return ""
     if isinstance(final_output, str):
         return _unwrap_literal_text(final_output)
-    if isinstance(final_output, BaseModel):
-        # LangChain messages (AIMessage & co) are pydantic models.
+    if hasattr(final_output, "content"):
+        # LangChain messages (AIMessage & co) are pydantic models or objects with content.
         content = getattr(final_output, "content", None)
         if content is not None:
             return _extract_response(content)
         return str(final_output)
     if isinstance(final_output, dict):
         for key in _RESPONSE_PAYLOAD_KEYS:
-            value = final_output.get(key)
-            if isinstance(value, str):
-                return _unwrap_literal_text(value)
+            if key in final_output:
+                value = final_output[key]
+                if value is not None:
+                    res = _extract_response(value)
+                    if res:
+                        return res
         messages = final_output.get("messages")
         if isinstance(messages, list) and messages:
             return _extract_response(messages[-1])
@@ -117,20 +144,15 @@ def _extract_response(final_output: Any) -> str:
         # Content blocks: [{"type": "text", "text": "..."}]
         parts: list[str] = []
         for item in final_output:
-            if isinstance(item, dict):
-                for key in ("text", "content", "chart"):
-                    value = item.get(key)
-                    if isinstance(value, str):
-                        parts.append(value)
-                        break
+            if isinstance(item, (dict, list)):
+                res = _extract_response(item)
+                if res:
+                    parts.append(res)
             elif isinstance(item, str):
-                parts.append(item)
+                parts.append(_unwrap_literal_text(item))
         if parts:
-            return _unwrap_literal_text("\n".join(parts))
+            return "\n".join(parts).strip()
         return str(final_output)
-    content = getattr(final_output, "content", None)
-    if content is not None:
-        return _extract_response(content)
     return str(final_output)
 
 

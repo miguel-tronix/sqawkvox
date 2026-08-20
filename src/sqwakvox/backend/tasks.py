@@ -154,4 +154,4 @@ def execute_agent(
         mcp_servers=hydrated_mcp,
         thread_id=thread_id,
     )
-    return result.__dict__
+    return result.__dict__ if hasattr(result, "__dict__") else result

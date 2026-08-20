@@ -32,6 +32,7 @@ from collections.abc import AsyncIterator, Iterator, Sequence
 from typing import Any, cast
 
 import redis
+from langchain_core.messages import BaseMessage
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.base import (
     WRITES_IDX_MAP,
@@ -54,6 +55,47 @@ def _enc(value: str) -> str:
 def _dec(encoded: str) -> str:
     padding = "=" * (-len(encoded) % 4)
     return base64.urlsafe_b64decode(encoded + padding).decode()
+
+
+def _sanitize_for_serde(obj: Any, depth: int = 0) -> Any:
+    """Recursively sanitize objects so JsonPlusSerializer/msgpack can serialize them.
+
+    Replaces non-serializable objects (like raw HTTP responses, un-encodable custom
+    types, or orphaned callables inside AIMessage/state) with string representations.
+    """
+    if depth > 50:
+        return str(obj)
+    if obj is None or isinstance(obj, (int, float, str, bool, bytes)):
+        return obj
+    if isinstance(obj, BaseMessage):
+        kwargs: dict[str, Any] = {}
+        for attr in ("content", "additional_kwargs", "response_metadata", "name", "id"):
+            if hasattr(obj, attr):
+                val = getattr(obj, attr)
+                if val is not None:
+                    kwargs[attr] = _sanitize_for_serde(val, depth + 1)
+        if hasattr(obj, "tool_calls") and getattr(obj, "tool_calls"):
+            kwargs["tool_calls"] = _sanitize_for_serde(getattr(obj, "tool_calls"), depth + 1)
+        return obj.__class__(**kwargs)
+    if isinstance(obj, dict):
+        return {str(k): _sanitize_for_serde(v, depth + 1) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        res = [_sanitize_for_serde(x, depth + 1) for x in obj]
+        return tuple(res) if isinstance(obj, tuple) else res
+    if isinstance(obj, set):
+        return {_sanitize_for_serde(x, depth + 1) for x in obj}
+
+    try:
+        JsonPlusSerializer().dumps_typed(obj)
+        return obj
+    except Exception:
+        if hasattr(obj, "model_dump") and callable(getattr(obj, "model_dump")):
+            try:
+                dumped = obj.model_dump()
+                return _sanitize_for_serde(dumped, depth + 1)
+            except Exception:
+                pass
+        return str(obj)
 
 
 class RedisCheckpointer(BaseCheckpointSaver[str]):
@@ -81,7 +123,11 @@ class RedisCheckpointer(BaseCheckpointSaver[str]):
     # Typed serialisation (JsonPlusSerializer exposes dumps_typed/loads_typed)
     # ------------------------------------------------------------------ #
     def _dumps(self, value: Any) -> str:
-        type_, blob = self.serde.dumps_typed(value)
+        try:
+            type_, blob = self.serde.dumps_typed(value)
+        except Exception:
+            sanitized = _sanitize_for_serde(value)
+            type_, blob = self.serde.dumps_typed(sanitized)
         encoded_blob = base64.b64encode(blob).decode() if isinstance(blob, bytes) else blob
         return json.dumps([type_, encoded_blob])
 

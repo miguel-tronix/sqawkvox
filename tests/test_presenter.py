@@ -192,3 +192,39 @@ async def test_poll_timeout_marks_failure_without_hanging() -> None:
         assert "Timed out waiting for task" in errors[0]
     finally:
         await presenter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("eager_backend")
+async def test_execute_agent_rehydrates_agent_result_with_filtered_keys() -> None:
+    from sqwakvox.controller import AgentResult
+
+    fake_controller = MagicMock()
+    res = AgentResult(response="Hello chart", success=True)
+    res_dict = res.__dict__.copy()
+    res_dict["extra_unrecognized_key"] = "extra_value"
+    fake_controller.execute_agent.return_value = res_dict
+
+    callbacks: list[tuple[TaskStatus, object]] = []
+    presenter = Presenter()
+    try:
+        with patch.object(tasks_mod, "_get_controller", return_value=fake_controller):
+            handle = await presenter.execute_agent(
+                model_id="gpt-4o",
+                api_key="key",
+                user_query="hi",
+                doc_context="",
+                active_document_name="",
+                data_store={},
+                on_complete=lambda status, payload: callbacks.append((status, payload)),
+            )
+        await handle.wait()
+
+        assert len(callbacks) == 1
+        status, payload = callbacks[0]
+        assert status == TaskStatus.SUCCESS
+        assert isinstance(payload, AgentResult)
+        assert payload.response == "Hello chart"
+        assert not hasattr(payload, "extra_unrecognized_key")
+    finally:
+        await presenter.close()
