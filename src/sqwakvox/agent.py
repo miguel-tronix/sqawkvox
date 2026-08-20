@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import ast
 import asyncio
+import json
 import logging
 import os
 import signal
@@ -19,6 +21,139 @@ from sqwakvox.models import ModelProvider
 from sqwakvox.telemetry import trace_span
 
 logger = logging.getLogger(__name__)
+
+
+# Keys that carry human-readable payloads when an agent response arrives as a
+# Python/JSON object literal instead of plain text (see _unwrap_literal_text).
+_RESPONSE_PAYLOAD_KEYS = (
+    "chart",
+    "ascii_chart",
+    "ascii",
+    "graph",
+    "diagram",
+    "output",
+    "text",
+    "content",
+    "response",
+    "answer",
+    "result",
+    "data",
+)
+
+
+def _parse_literal(val: str) -> Any:
+    """Parse string val as JSON or Python literal, returning None on failure."""
+    val_str = val.strip()
+    try:
+        return json.loads(val_str)
+    except Exception:
+        pass
+    try:
+        return ast.literal_eval(val_str)
+    except Exception:
+        return None
+
+
+def _unwrap_literal_text(text: str) -> str:
+    """Recover human-readable text when a response is (or embeds) a literal.
+
+    Two real-world failure modes produce a Python-object-looking blob instead
+    of the actual answer / ASCII chart:
+
+    * the ``mcp-ascii-charts`` MCP server returns ``{"chart": ..., "title":
+      ...}`` or JSON/Python dict payloads that models frequently echo verbatim into
+      their final answer;
+    * any_agent's langchain adapter does ``str(last_message.content)``, which
+      turns a content-block list into its Python repr.
+
+    Tries both JSON and Python literal parsing to extract embedded chart payloads.
+    """
+    stripped = text.strip()
+    if stripped.startswith(("{", "[")):
+        parsed = _parse_literal(stripped)
+        if parsed is not None and parsed != text and not isinstance(parsed, str):
+            extracted = _extract_response(parsed)
+            if extracted:
+                return extracted
+
+    # Object embedded in prose (e.g. "Here is the chart:\n{'chart': '...'}"):
+    # find balanced {...} or [...] spans and unwrap them if they carry a text payload.
+    for open_char, close_char in (("{", "}"), ("[", "]")):
+        pos = 0
+        while True:
+            start = text.find(open_char, pos)
+            if start == -1:
+                break
+            depth = 0
+            found_end = -1
+            for idx in range(start, len(text)):
+                if text[idx] == open_char:
+                    depth += 1
+                elif text[idx] == close_char:
+                    depth -= 1
+                    if depth == 0:
+                        found_end = idx
+                        break
+            if found_end != -1:
+                candidate = text[start : found_end + 1]
+                parsed = _parse_literal(candidate)
+                if parsed is not None and not isinstance(parsed, str):
+                    extracted = _extract_response(parsed)
+                    if extracted and extracted != candidate:
+                        prefix = text[:start].rstrip()
+                        suffix = text[found_end + 1 :].strip()
+                        return f"{prefix}\n{extracted}\n{suffix}".strip()
+                pos = start + 1
+            else:
+                break
+    return text
+
+
+def _extract_response(final_output: Any) -> str:
+    """Best-effort plain-text extraction from any_agent's ``final_output``.
+
+    ``final_output`` is typed ``str | dict | BaseModel | None``; a naive
+    ``str()`` on a dict/BaseModel leaks a Python object repr into the
+    user-facing response — an ascii-chart answer arrives as ``{'chart':
+    '...'}`` instead of the chart itself.
+    """
+    if final_output is None:
+        return ""
+    if isinstance(final_output, str):
+        return _unwrap_literal_text(final_output)
+    if hasattr(final_output, "content"):
+        # LangChain messages (AIMessage & co) are pydantic models or objects with content.
+        content = getattr(final_output, "content", None)
+        if content is not None:
+            return _extract_response(content)
+        return str(final_output)
+    if isinstance(final_output, dict):
+        for key in _RESPONSE_PAYLOAD_KEYS:
+            if key in final_output:
+                value = final_output[key]
+                if value is not None:
+                    res = _extract_response(value)
+                    if res:
+                        return res
+        messages = final_output.get("messages")
+        if isinstance(messages, list) and messages:
+            return _extract_response(messages[-1])
+        return str(final_output)
+    if isinstance(final_output, list):
+        # Content blocks: [{"type": "text", "text": "..."}]
+        parts: list[str] = []
+        for item in final_output:
+            if isinstance(item, (dict, list)):
+                res = _extract_response(item)
+                if res:
+                    parts.append(res)
+            elif isinstance(item, str):
+                parts.append(_unwrap_literal_text(item))
+        if parts:
+            return "\n".join(parts).strip()
+        return str(final_output)
+    return str(final_output)
+
 
 # Conversation memory lives in a dedicated Redis logical DB, separate from the
 # Celery broker (db 0) and result backend (db 1).  Override if needed.
@@ -303,7 +438,10 @@ class AnyAgentOrchestrator:
                     timeout=AGENT_RUN_TIMEOUT_SECONDS,
                 )
                 elapsed = time.monotonic() - start_time
-                response = str(trace.final_output)
+                # final_output is str | dict | BaseModel | None — unwrap it so
+                # structured/chart payloads don't leak Python object reprs
+                # into the user-facing response (see _extract_response).
+                response = _extract_response(trace.final_output)
                 span.set_attribute("response_len", len(response))
                 span.set_attribute("elapsed_sec", elapsed)
                 span.set_attribute("trace_spans_count", len(trace.spans))
@@ -524,7 +662,12 @@ class AnyAgentOrchestrator:
             return
 
         current_pid = os.getpid()
-        targets = {"mcp_calc_server", "mcp-server-fetch", "mcp-server-sqlite"}
+        targets = {
+            "mcp_calc_server",
+            "mcp-server-fetch",
+            "mcp-server-sqlite",
+            "mcp-ascii-charts",
+        }
         for proc in psutil.process_iter(["pid", "ppid", "cmdline", "name"]):
             try:
                 if proc.pid == current_pid or proc.ppid() != current_pid:
@@ -534,5 +677,12 @@ class AnyAgentOrchestrator:
                 if any(target in joined for target in targets):
                     logger.warning("Killing orphaned MCP child process %s: %s", proc.pid, joined)
                     proc.send_signal(signal.SIGTERM)
+                    # Wrappers like `npx`/`uvx` leave grandchildren (node,
+                    # python) behind; reap the whole tree.
+                    for child in proc.children(recursive=True):
+                        try:
+                            child.send_signal(signal.SIGTERM)
+                        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+                            continue
             except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
                 continue

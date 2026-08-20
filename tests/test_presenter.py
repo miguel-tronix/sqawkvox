@@ -2,11 +2,12 @@ import asyncio
 from unittest.mock import MagicMock, patch
 
 import pytest
+from celery.result import AsyncResult
 
 from sqwakvox.backend import tasks as tasks_mod
 from sqwakvox.backend.celery_app import celery_app
 from sqwakvox.models import StructuredDocument, TableData
-from sqwakvox.presenter import Presenter, TaskStatus
+from sqwakvox.presenter import Presenter, TaskHandle, TaskStatus
 
 
 @pytest.fixture
@@ -125,8 +126,8 @@ async def test_submit_task_backend_unavailable() -> None:
     presenter = Presenter()
     try:
         with patch.object(
-            tasks_mod.convert_document,
-            "apply_async",
+            celery_app,
+            "send_task",
             side_effect=ConnectionError("broker down"),
         ):
             handle = await presenter.submit_task(
@@ -160,5 +161,74 @@ async def test_handle_wait_returns_terminal_status() -> None:
         status = await asyncio.wait_for(handle.wait(), timeout=5.0)
         assert status == TaskStatus.SUCCESS
         assert handle.status == TaskStatus.SUCCESS
+    finally:
+        await presenter.close()
+
+
+@pytest.mark.asyncio
+@patch("sqwakvox.presenter.DEFAULT_POLL_TIMEOUT", 0.5)
+async def test_poll_timeout_marks_failure_without_hanging() -> None:
+    """If a task never reaches a terminal state, the poll loop must resolve
+    to FAILURE after DEFAULT_POLL_TIMEOUT instead of looping forever.
+    """
+    presenter = Presenter()
+    try:
+        result = MagicMock(spec=AsyncResult)
+        result.id = "nonexistent-task-id"
+        result.ready.return_value = False
+        result.state = "PENDING"
+
+        handle = TaskHandle(task_id="nonexistent-task-id", task_name="convert_document")
+        errors: list[str] = []
+        await presenter._poll(
+            result,
+            handle=handle,
+            on_progress=None,
+            on_complete=None,
+            on_error=errors.append,
+            poll_timeout=0.5,
+        )
+        assert handle.status == TaskStatus.FAILURE
+        assert "Timed out waiting for task" in handle.error
+        assert "after " in handle.error
+        assert "s. " in handle.error
+        assert len(errors) == 1
+        assert "Timed out waiting for task" in errors[0]
+    finally:
+        await presenter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("eager_backend")
+async def test_execute_agent_rehydrates_agent_result_with_filtered_keys() -> None:
+    from sqwakvox.controller import AgentResult
+
+    fake_controller = MagicMock()
+    res = AgentResult(response="Hello chart", success=True)
+    res_dict = res.__dict__.copy()
+    res_dict["extra_unrecognized_key"] = "extra_value"
+    fake_controller.execute_agent.return_value = res_dict
+
+    callbacks: list[tuple[TaskStatus, object]] = []
+    presenter = Presenter()
+    try:
+        with patch.object(tasks_mod, "_get_controller", return_value=fake_controller):
+            handle = await presenter.execute_agent(
+                model_id="gpt-4o",
+                api_key="key",
+                user_query="hi",
+                doc_context="",
+                active_document_name="",
+                data_store={},
+                on_complete=lambda status, payload: callbacks.append((status, payload)),
+            )
+        await handle.wait()
+
+        assert len(callbacks) == 1
+        status, payload = callbacks[0]
+        assert status == TaskStatus.SUCCESS
+        assert isinstance(payload, AgentResult)
+        assert payload.response == "Hello chart"
+        assert not hasattr(payload, "extra_unrecognized_key")
     finally:
         await presenter.close()

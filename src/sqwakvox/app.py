@@ -567,6 +567,47 @@ class SqwakvoxApp(App[None]):
         except RuntimeError:
             _write()
 
+    def write_agent_message(self, label_markup: str, body: str, persist: bool = True) -> None:
+        """Write a labelled agent message with the body rendered verbatim.
+
+        The body is rendered as literal text (no Rich markup parsing, ANSI
+        escapes honoured) so ASCII charts and JSON/Python-object payloads
+        display exactly as the backend produced them instead of being
+        mangled by the Rich markup parser.
+        """
+        from rich.text import Text
+
+        try:
+            label_text = Text.from_markup(label_markup)
+        except Exception:
+            label_text = Text(label_markup)
+
+        try:
+            body_text = Text.from_ansi(body)
+        except Exception:
+            body_text = Text(body)
+
+        assembled = Text.assemble(label_text, body_text)
+
+        def _write() -> None:
+            chat_log = self.query_one("#chat-log", RichLog)
+            chat_log.write(assembled)
+            try:
+                agent_pane = self.query_one("#agent-response-pane", RichLog)
+                agent_pane.write(assembled)
+            except Exception:
+                pass
+            if persist and self.active_document_name:
+                if self.active_document_name not in self.chat_histories:
+                    self.chat_histories[self.active_document_name] = []
+                self.chat_histories[self.active_document_name].append(label_markup + body)
+                self._save_chat_log(self.active_document_name)
+
+        try:
+            self.call_from_thread(_write)
+        except RuntimeError:
+            _write()
+
     def action_scroll_up(self) -> None:
         focused = self.focused
         if focused and hasattr(focused, "scroll_up"):
@@ -924,8 +965,9 @@ class SqwakvoxApp(App[None]):
         self._on_agent_success(result.response, user_query)
 
     def _on_agent_success(self, response: str, query: str) -> None:
-        self.write_chat_message(f"[bold green]Agent:[/bold green] {response}", persist=True)
-        self.write_agent_response(f"[bold green]Agent:[/bold green] {response}")
+        # Render the body verbatim (no markup parsing) so ASCII charts and
+        # structured payloads display as produced, not as Rich markup.
+        self.write_agent_message("[bold green]Agent:[/bold green] ", response)
         chat_logger.info("Agent response (%d chars)", len(response))
 
         AuditLogger.log(
