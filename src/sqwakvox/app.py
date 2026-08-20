@@ -1007,12 +1007,23 @@ class SqwakvoxApp(App[None]):
 
     def _rebuild_tabs(self) -> None:
         tabs = self.query_one("#document-tabs", Tabs)
-        tabs.clear()
+        valid_tab_ids: set[str] = set()
         for idx, source in enumerate(self.ingestion_history):
             doc = self.loaded_documents.get(source)
             if doc:
                 tab_id = f"tab_{idx}"
-                tabs.add_tab(Tab(doc.file_name, id=tab_id))
+                valid_tab_ids.add(tab_id)
+                existing_tabs = tabs.query(f"#{tab_id}")
+                if existing_tabs:
+                    tab = existing_tabs.first(Tab)
+                    if tab and tab.label != doc.file_name:
+                        tab.label = doc.file_name
+                else:
+                    tabs.add_tab(Tab(doc.file_name, id=tab_id))
+
+        for tab in list(tabs.query(Tab)):
+            if tab.id and tab.id not in valid_tab_ids:
+                tab.remove()
 
     def _switch_to_document(self, doc: StructuredDocument, source: str) -> None:
         self.structured_doc = doc
