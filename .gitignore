@@ -11,6 +11,7 @@ __pycache__
 sqwakvox.log
 sqwakvoxchat.log
 sqwakvox_telemetry.jsonl
+run_worker_error.txt
 *.log
 *.jsonl
 # VSCode
