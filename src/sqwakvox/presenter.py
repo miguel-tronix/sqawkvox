@@ -94,11 +94,16 @@ class Presenter:
         args: list[Any] | None = None,
         kwargs: dict[str, Any] | None = None,
         *,
+        queue: str | None = None,
         on_progress: Callable[[TaskStatus, Any], None] | None = None,
         on_complete: Callable[[TaskStatus, Any], None] | None = None,
         on_error: Callable[[str], None] | None = None,
     ) -> TaskHandle:
         """Submit *task_name* and return a :class:`TaskHandle`.
+
+        ``queue`` optionally routes the task to a specific Celery queue
+        (used for per-document-tab workers — see
+        :mod:`sqwakvox.worker_manager`); ``None`` uses the app default.
 
         ``on_progress`` fires with every poll (status + raw payload).
         ``on_complete`` fires once with the final status + result.
@@ -135,9 +140,14 @@ class Presenter:
                 # Use the task's registered name (``fn.name``), not the short
                 # lookup key: the worker registers tasks under their full
                 # ``sqwakvox.backend.tasks.*`` names.
+                send_kwargs: dict[str, Any] = {}
+                if queue is not None:
+                    send_kwargs["queue"] = queue
                 result = await loop.run_in_executor(
                     None,
-                    lambda: celery_app.send_task(fn.name, args=args or [], kwargs=kwargs or {}),
+                    lambda: celery_app.send_task(
+                        fn.name, args=args or [], kwargs=kwargs or {}, **send_kwargs
+                    ),
                 )
         except Exception as exc:
             if celery_app.conf.task_always_eager:
@@ -176,8 +186,10 @@ class Presenter:
         """
         message = (
             f"Backend unavailable: could not submit task '{task_name}'. "
-            "Is the Celery worker and Redis broker running? "
-            "Start it with: python -m sqwakvox.run_worker"
+            "Is Redis running, and is a Celery worker available? "
+            "The TUI normally spawns its own workers per document tab; "
+            "to run one manually instead set SQWAKVOX_MANAGED_WORKERS=0 "
+            "and start it with: python -m sqwakvox.run_worker"
         )
         handle = TaskHandle(task_id="", task_name=task_name)
         handle.status = TaskStatus.FAILURE
@@ -195,6 +207,8 @@ class Presenter:
     async def parse_document(
         self,
         source: str,
+        *,
+        queue: str | None = None,
         on_progress: Callable[[TaskStatus, Any], None] | None = None,
         on_complete: Callable[[TaskStatus, StructuredDocument | None], None] | None = None,
         on_error: Callable[[str], None] | None = None,
@@ -216,6 +230,7 @@ class Presenter:
         return await self.submit_task(
             "convert_document",
             args=[source],
+            queue=queue,
             on_progress=on_progress,
             on_complete=_on_complete,
             on_error=on_error,
@@ -224,12 +239,15 @@ class Presenter:
     async def build_data_store(
         self,
         document: StructuredDocument,
+        *,
+        queue: str | None = None,
         on_complete: Callable[[TaskStatus, dict[str, str]], None] | None = None,
         on_error: Callable[[str], None] | None = None,
     ) -> TaskHandle:
         return await self.submit_task(
             "build_financial_data_store",
             args=[document.model_dump()],
+            queue=queue,
             on_complete=on_complete,
             on_error=on_error,
         )
@@ -240,12 +258,15 @@ class Presenter:
     async def cross_validate(
         self,
         document: StructuredDocument,
+        *,
+        queue: str | None = None,
         on_complete: Callable[[TaskStatus, CVResult], None] | None = None,
         on_error: Callable[[str], None] | None = None,
     ) -> TaskHandle:
         return await self.submit_task(
             "cross_validate",
             args=[document.model_dump()],
+            queue=queue,
             on_complete=on_complete,
             on_error=on_error,
         )
@@ -260,6 +281,8 @@ class Presenter:
         data_store: dict[str, str],
         mcp_servers: list[dict[str, Any]] | None = None,
         thread_id: str | None = None,
+        *,
+        queue: str | None = None,
         on_progress: Callable[[TaskStatus, Any], None] | None = None,
         on_complete: Callable[[TaskStatus, AgentResult], None] | None = None,
         on_error: Callable[[str], None] | None = None,
@@ -285,6 +308,7 @@ class Presenter:
                 mcp_servers,
                 thread_id,
             ],
+            queue=queue,
             on_progress=on_progress,
             on_complete=_on_complete,
             on_error=on_error,

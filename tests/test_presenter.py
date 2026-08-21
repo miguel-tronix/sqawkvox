@@ -148,6 +148,66 @@ async def test_submit_task_backend_unavailable() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.usefixtures("async_backend")
+async def test_submit_task_routes_to_requested_queue() -> None:
+    """Per-document-tab routing: ``queue=`` must reach ``send_task``."""
+    captured: dict[str, object] = {}
+
+    def fake_send_task(_name: str, *_rest: object, **extra: object):
+        captured["name"] = _name
+        captured["queue"] = extra.get("queue")
+        result = MagicMock(spec=AsyncResult)
+        result.id = "task-123"
+        result.ready.return_value = True
+        result.state = "SUCCESS"
+        result.get.return_value = {"ok": True}
+        return result
+
+    presenter = Presenter()
+    try:
+        with patch.object(celery_app, "send_task", side_effect=fake_send_task):
+            handle = await presenter.submit_task(
+                "convert_document",
+                args=["x.pdf"],
+                queue="sqwakvox.doc0",
+            )
+        await handle.wait()
+
+        assert captured["name"] == "sqwakvox.backend.tasks.convert_document"
+        assert captured["queue"] == "sqwakvox.doc0"
+        assert handle.task_id == "task-123"
+        assert handle.status == TaskStatus.SUCCESS
+    finally:
+        await presenter.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.usefixtures("async_backend")
+async def test_submit_task_without_queue_uses_default_routing() -> None:
+    captured: dict[str, object] = {}
+
+    def fake_send_task(_name: str, *_rest: object, **extra: object):
+        captured["queue"] = extra.get("queue")
+        result = MagicMock(spec=AsyncResult)
+        result.id = "task-456"
+        result.ready.return_value = True
+        result.state = "SUCCESS"
+        result.get.return_value = {"ok": True}
+        return result
+
+    presenter = Presenter()
+    try:
+        with patch.object(celery_app, "send_task", side_effect=fake_send_task):
+            handle = await presenter.submit_task("convert_document", args=["x.pdf"])
+        await handle.wait()
+
+        assert captured["queue"] is None  # Celery default queue applies
+        assert handle.status == TaskStatus.SUCCESS
+    finally:
+        await presenter.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.usefixtures("eager_backend")
 async def test_handle_wait_returns_terminal_status() -> None:
     doc = StructuredDocument(file_name="a.pdf", raw_markdown="# Hello")
