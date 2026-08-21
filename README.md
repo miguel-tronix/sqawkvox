@@ -57,16 +57,29 @@ document ingestion, cross-validation, and agent execution.
 
 ### Running the backend
 
-The TUI and the worker are separate processes connected by a Redis broker.
-Start Redis, then the worker, then the TUI:
+You no longer need to start a worker by hand. The TUI spawns and manages its
+own Celery workers automatically: **each document tab gets a dedicated worker
+process on its own queue** (`sqwakvox.doc0`, `sqwakvox.doc1`, ...), so a slow
+Docling parse on one document never blocks chat or cross-validation on
+another. Workers are shut down when the TUI exits, and their logs are written
+to `./sqwakvox_workers/`.
+
+```bash
+# Start Redis, then just the TUI:
+redis-server &
+uv run sqwakvox
+```
+
+Prefer to run the worker yourself (single shared queue)? Set
+`SQWAKVOX_MANAGED_WORKERS=0` when launching the TUI:
 
 ```bash
 # Terminal 1 — Celery worker
 python -m sqwakvox.run_worker
 # or with uv: uv run python -m sqwakvox.run_worker
 
-# Terminal 2 — TUI
-sqwakvox
+# Terminal 2 — TUI (managed workers disabled)
+SQWAKVOX_MANAGED_WORKERS=0 sqwakvox
 ```
 
 The broker and result-backend default to `redis://localhost:6379`. Override

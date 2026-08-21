@@ -36,6 +36,7 @@ from sqwakvox.models import ModelProvider, StructuredDocument
 from sqwakvox.presenter import Presenter, TaskStatus
 from sqwakvox.renderer import DocumentRenderPane
 from sqwakvox.telemetry import get_telemetry
+from sqwakvox.worker_manager import WorkerManager, managed_workers_enabled
 
 logger = logging.getLogger(__name__)
 chat_logger = logging.getLogger("sqwakvox.chat")
@@ -263,7 +264,7 @@ class SqwakvoxApp(App[None]):
     def __init__(self, presenter: Presenter | None = None) -> None:
         super().__init__()
         self.presenter = presenter or Presenter()
-        self._active_parse_handle: Worker[None] | None = None
+        self._active_parse_handles: dict[str, Worker[None]] = {}
         self._active_agent_handles: dict[str, Worker[None]] = {}
         self.doc_context: str = ""
         self.structured_doc: StructuredDocument | None = None
@@ -273,6 +274,45 @@ class SqwakvoxApp(App[None]):
         self._chat_log_dir = Path.home() / ".sqwakvox_chat_logs"
         self._chat_log_dir.mkdir(parents=True, exist_ok=True)
         self.mcp_configs: list[tuple[str, Any]] = []
+        # Per-document-tab Celery queues and their managed workers.  Each
+        # loaded document gets its own queue (``sqwakvox.doc<N>``) served by
+        # a dedicated worker subprocess, so a slow parse on one tab never
+        # blocks chat on another.
+        self._doc_queues: dict[str, str] = {}
+        self.worker_manager = WorkerManager()
+
+    def _queue_for_source(self, source: str) -> str | None:
+        """Return the dedicated queue for *source*, assigning one on first use.
+
+        Returns ``None`` when managed workers are disabled — tasks then fall
+        through to the default ``sqwakvox`` queue consumed by an externally
+        started worker.
+        """
+        if not managed_workers_enabled():
+            return None
+        if source not in self._doc_queues:
+            self._doc_queues[source] = f"sqwakvox.doc{len(self._doc_queues)}"
+        return self._doc_queues[source]
+
+    def _active_source(self) -> str | None:
+        """Return the ingestion source of the currently active document."""
+        if self.structured_doc is None:
+            return None
+        for src, doc in self.loaded_documents.items():
+            if doc.file_name == self.active_document_name:
+                return src
+        return None
+
+    def _active_queue(self) -> str | None:
+        """Queue of the active document's worker, or None to use the default."""
+        source = self._active_source()
+        if source is None:
+            return None
+        return self._doc_queues.get(source)
+
+    def on_unmount(self) -> None:
+        """Stop all managed worker subprocesses when the TUI shuts down."""
+        self.worker_manager.stop_all()
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=True)
@@ -467,19 +507,19 @@ class SqwakvoxApp(App[None]):
         btn_send = self.query_one("#btn-send", Button)
         btn_parse = self.query_one("#btn-parse", Button)
 
+        # Chat stays available whenever any document is ready, even while
+        # another document is still parsing on its own worker.
+        is_ready = bool(self.doc_context)
+        chat_input.disabled = not is_ready
+        btn_send.disabled = not is_ready
+
         if self.is_parsing:
             status_bar.update("Status: Processing Layout via Docling...")
             spinner.visible = True
-            chat_input.disabled = True
-            btn_send.disabled = True
-            btn_parse.disabled = True
         else:
-            is_ready = bool(self.doc_context)
             status_bar.update("Status: Idle | Ready" if is_ready else "Status: Idle")
             spinner.visible = False
-            chat_input.disabled = not is_ready
-            btn_send.disabled = not is_ready
-            btn_parse.disabled = False
+        btn_parse.disabled = False
 
     def watch_is_parsing(self, _new_value: bool) -> None:
         self._update_ui_state()
@@ -679,6 +719,7 @@ class SqwakvoxApp(App[None]):
         try:
             await self.presenter.cross_validate(
                 document=doc,
+                queue=self._active_queue(),
                 on_complete=on_complete,
                 on_error=lambda err: self.write_chat_message(
                     f"[bold red]Cross-validation error:[/bold red] {escape(extract_message(err))}",
@@ -712,10 +753,11 @@ class SqwakvoxApp(App[None]):
         if not source:
             return
 
-        # If a parse is already in flight, do nothing.
-        if self._active_parse_handle is not None:
+        # Only block a duplicate parse of the *same* source; different
+        # sources parse concurrently, each on its own document worker.
+        if source in self._active_parse_handles:
             self.write_chat_message(
-                "[bold yellow]A document parse is already in progress.[/bold yellow]",
+                f"[bold yellow]A parse of {source} is already in progress.[/bold yellow]",
                 persist=False,
             )
             return
@@ -735,14 +777,30 @@ class SqwakvoxApp(App[None]):
 
         # Textual workers are asyncio Tasks on the same event loop as the
         # presenter, so we can await presenter calls directly.
-        self._active_parse_handle = self.run_worker(
+        self._active_parse_handles[source] = self.run_worker(
             self._dispatch_parse(source),
-            name="docling_parser",
+            name=f"docling_parser_{source}",
         )
 
     async def _dispatch_parse(self, source: str) -> None:
         """Async Textual worker that delegates document parsing to the
-        Presenter (which talks to Celery in a background thread)."""
+        Presenter (which talks to Celery in a background thread).
+
+        The source is assigned its own Celery queue and a dedicated worker
+        subprocess is spawned for it on first load, so each document tab is
+        served in isolation.
+        """
+        # Assign this document its own queue and make sure a worker is
+        # running for it before the task is submitted.  The task may land in
+        # the queue a moment before the worker finishes booting; Celery holds
+        # it until the worker starts consuming.
+        queue = self._queue_for_source(source)
+        if queue is not None:
+            self.worker_manager.ensure_worker(queue)
+            self.write_chat_message(
+                f"[italic dim]Worker ready for tab queue: {queue}[/italic dim]",
+                persist=False,
+            )
 
         def on_progress(status: TaskStatus, _payload: Any) -> None:
             if status == TaskStatus.STARTED:
@@ -761,20 +819,29 @@ class SqwakvoxApp(App[None]):
                 self._on_parse_failure(payload if isinstance(payload, str) else str(payload))
             elif status in (TaskStatus.REVOKED, TaskStatus.CANCELLED):
                 self._on_parse_failure("Parse was cancelled.")
-            self._active_parse_handle = None
+            self._finish_parse(source)
 
         try:
             await self.presenter.parse_document(
                 source=source,
+                queue=queue,
                 on_progress=on_progress,
                 on_complete=on_complete,
             )
         except Exception as exc:
-            self._active_parse_handle = None
+            self._finish_parse(source)
             self._on_parse_failure(str(exc))
 
+    def _finish_parse(self, source: str) -> None:
+        """Drop *source*'s parse handle; clear the parsing flag when done."""
+        with contextlib.suppress(KeyError):
+            del self._active_parse_handles[source]
+        if not self._active_parse_handles:
+            self.is_parsing = False
+
     def _on_parse_success(self, structured: StructuredDocument, source: str) -> None:
-        self.is_parsing = False
+        # Note: is_parsing is cleared by _finish_parse once *all* in-flight
+        # parses (possibly concurrent, one per document tab) have settled.
         self.loaded_documents[source] = structured
         if structured.file_name not in self.chat_histories:
             saved = self._load_chat_log(structured.file_name)
@@ -792,7 +859,8 @@ class SqwakvoxApp(App[None]):
         self._switch_to_document(structured, source="ingest")
 
     def _on_parse_failure(self, error_message: str) -> None:
-        self.is_parsing = False
+        # Note: is_parsing is cleared by _finish_parse once *all* in-flight
+        # parses (possibly concurrent, one per document tab) have settled.
         self.active_error = error_message
         self.write_chat_message(
             f"[bold red]✗ Parsing failed:[/bold red] {escape(extract_message(error_message))}",
@@ -875,6 +943,7 @@ class SqwakvoxApp(App[None]):
         try:
             ds_handle = await self.presenter.build_data_store(
                 document=doc,
+                queue=self._active_queue(),
                 on_error=self._on_agent_failure,
             )
             # Wait until the data-store task finishes (callbacks fire on this loop).
@@ -920,6 +989,7 @@ class SqwakvoxApp(App[None]):
                 data_store=data_store,
                 mcp_servers=mcp_servers,
                 thread_id=self.active_document_name or None,
+                queue=self._active_queue(),
                 on_progress=on_progress,
                 on_complete=on_complete,
                 on_error=self._on_agent_failure,
