@@ -31,8 +31,11 @@ MCP_SERVERS_ADAPTER: TypeAdapter[list[MCPParams]] = TypeAdapter(list[MCPParams])
 def _get_controller() -> AppController:
     """Create a fresh controller per process.
 
-    ``DocumentConverter`` is heavyweight and carries open file handles, so we
-    lazily instantiate it once per worker process via the task closure.
+    The controller itself is cheap; the heavyweight ``DocumentConverter`` it
+    wraps is built lazily on the first ``convert_document`` call, so only the
+    shared Docling ingest worker ever instantiates it (see
+    :mod:`sqwakvox.worker_manager`).  Per-document agent workers never
+    construct Docling models at all.
     """
     return AppController()
 

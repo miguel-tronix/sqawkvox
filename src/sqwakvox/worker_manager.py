@@ -6,11 +6,21 @@ Historically the TUI required a *separately started* worker process::
     Terminal 2:  python -m sqwakvox
 
 :class:`WorkerManager` removes that second terminal: when a document is
-loaded the TUI asks the manager to ensure a worker exists for that
-document's dedicated queue (``sqwakvox.doc<N>``), spawning
-``python -m sqwakvox.run_worker`` as a child subprocess when needed.  Each
-document tab therefore gets its own isolated worker — a slow Docling OCR
-parse on one document never blocks agent queries on another.
+loaded the TUI asks the manager to ensure workers exist for the queues that
+need serving, spawning ``python -m sqwakvox.run_worker`` child subprocesses
+when needed.
+
+Two kinds of managed workers exist:
+
+* **One shared Docling ingest worker** on :data:`DOCLING_QUEUE`
+  (``sqwakvox.docling``).  It consumes every document-conversion task, so
+  Docling's heavyweight OCR/layout models are loaded at most
+  ``DOCLING_WORKER_CONCURRENCY`` times machine-wide instead of once per
+  open tab.
+* **One isolated agent worker per document tab** (``sqwakvox.doc<N>``).
+  Each tab's data-store, cross-validation, and agent tasks run on its own
+  worker, so a long-running agent query on one tab never blocks chat on
+  another.  These workers never construct a ``DocumentConverter``.
 
 Workers are terminated on :meth:`stop_all` (wired to the app's unmount and
 an ``atexit`` backstop).  Set ``SQWAKVOX_MANAGED_WORKERS=0`` to disable the
@@ -33,9 +43,18 @@ logger = logging.getLogger(__name__)
 #: Environment variable that disables managed workers entirely.
 DISABLE_ENV = "SQWAKVOX_MANAGED_WORKERS"
 
+#: Shared queue for document conversion (Docling) tasks.  A single managed
+#: worker consumes this queue on behalf of every open document tab.
+DOCLING_QUEUE = "sqwakvox.docling"
+
+#: Concurrency used for the shared Docling ingest worker.  One document
+#: conversion can run per child process; a small pool lets several tabs
+#: parse in parallel while keeping total Docling model instances bounded.
+DOCLING_WORKER_CONCURRENCY = 2
+
 #: Concurrency used for spawned per-document workers.  One document's tasks
-#: are mostly sequential (parse -> data store -> agent), so a small pool is
-#: enough; this keeps total CPU usage sane with many tabs open.
+#: are mostly sequential (data store -> cross-validate -> agent), so a small
+#: pool is enough; this keeps total CPU usage sane with many tabs open.
 DOC_WORKER_CONCURRENCY = 2
 
 
@@ -58,7 +77,7 @@ class WorkerManager:
         """Queues with a currently-running managed worker."""
         return [q for q, proc in self._workers.items() if proc.poll() is None]
 
-    def ensure_worker(self, queue: str) -> bool:
+    def ensure_worker(self, queue: str, concurrency: int = DOC_WORKER_CONCURRENCY) -> bool:
         """Ensure a worker consumes *queue*, spawning one if necessary.
 
         Returns True if a new worker was spawned, False if one was already
@@ -81,7 +100,7 @@ class WorkerManager:
             "--loglevel",
             "WARNING",
             "--concurrency",
-            str(DOC_WORKER_CONCURRENCY),
+            str(concurrency),
             "--no-beat",  # only one beat scheduler may run machine-wide
         ]
 
@@ -113,6 +132,14 @@ class WorkerManager:
             log_path,
         )
         return True
+
+    def ensure_docling_worker(self) -> bool:
+        """Ensure the single shared Docling ingest worker is running.
+
+        Idempotent: only one process ever consumes :data:`DOCLING_QUEUE`,
+        no matter how many document tabs are open.
+        """
+        return self.ensure_worker(DOCLING_QUEUE, concurrency=DOCLING_WORKER_CONCURRENCY)
 
     def stop_all(self, timeout: float = 5.0) -> None:
         """Terminate every managed worker, escalating to kill on timeout."""

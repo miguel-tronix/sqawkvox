@@ -4,6 +4,7 @@ from textual.widgets import ListView, Tab, Tabs
 from sqwakvox.app import SqwakvoxApp
 from sqwakvox.models import StructuredDocument
 from sqwakvox.presenter import TaskStatus
+from sqwakvox.worker_manager import DOCLING_QUEUE
 
 
 def _doc1() -> StructuredDocument:
@@ -82,11 +83,11 @@ def _stub_parse(
 
 
 @pytest.mark.asyncio
-async def test_document_load_spawns_dedicated_worker_per_tab(
+async def test_document_load_routes_parse_to_shared_docling_worker(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Loading a document must spawn a worker on its own per-tab queue and
-    route the parse task there; each subsequent tab gets its own worker."""
+    """Parsing must route to the *shared* Docling queue and ensure the shared
+    docling worker, while each tab still gets its own agent queue/worker."""
     app = SqwakvoxApp()
     async with app.run_test():
         ensured: list[str] = []
@@ -95,19 +96,32 @@ async def test_document_load_spawns_dedicated_worker_per_tab(
             "ensure_worker",
             lambda queue: ensured.append(queue) or True,
         )
+        docling_ensured: list[bool] = []
+        monkeypatch.setattr(
+            app.worker_manager,
+            "ensure_docling_worker",
+            lambda: docling_ensured.append(True) or True,
+        )
 
         routed1 = _stub_parse(monkeypatch, app, _doc1())
         await app._dispatch_parse("/tmp/doc1.pdf")
 
+        # Tab 1 gets its own agent queue AND the shared docling worker is
+        # ensured; the parse task itself goes to the docling queue.
         assert ensured == ["sqwakvox.doc0"]
-        assert routed1 == [("/tmp/doc1.pdf", "sqwakvox.doc0")]
+        assert docling_ensured == [True]
+        assert routed1 == [("/tmp/doc1.pdf", DOCLING_QUEUE)]
         assert app.active_document_name == "doc1.pdf"
 
         routed2 = _stub_parse(monkeypatch, app, _doc2())
         await app._dispatch_parse("/tmp/doc2.pdf")
 
+        # Tab 2 gets its own agent queue; the docling worker is shared, so it
+        # is only ensured (never re-spawned) — the real WorkerManager treats
+        # the second ensure as a no-op.
         assert ensured == ["sqwakvox.doc0", "sqwakvox.doc1"]
-        assert routed2 == [("/tmp/doc2.pdf", "sqwakvox.doc1")]
+        assert docling_ensured == [True, True]
+        assert routed2 == [("/tmp/doc2.pdf", DOCLING_QUEUE)]
         assert app.active_document_name == "doc2.pdf"
 
 
@@ -115,14 +129,14 @@ async def test_document_load_spawns_dedicated_worker_per_tab(
 async def test_active_queue_follows_selected_tab(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Chat/cross-validate tasks route to the active document's worker."""
+    """Chat/cross-validate tasks route to the active document's agent worker."""
     app = SqwakvoxApp()
     async with app.run_test() as pilot:
         ensured: list[str] = []
         monkeypatch.setattr(
             app.worker_manager,
             "ensure_worker",
-            lambda queue: ensured.append(queue) or True,
+            lambda queue, **_kwargs: ensured.append(queue) or True,
         )
 
         _stub_parse_routed1 = _stub_parse(monkeypatch, app, _doc1())
@@ -149,14 +163,21 @@ async def test_managed_workers_disabled_falls_back_to_default_queue(
     app = SqwakvoxApp()
     async with app.run_test():
         ensured: list[str] = []
+        docling_ensured: list[bool] = []
         monkeypatch.setattr(
             app.worker_manager,
             "ensure_worker",
             lambda queue: ensured.append(queue) or True,
         )
+        monkeypatch.setattr(
+            app.worker_manager,
+            "ensure_docling_worker",
+            lambda: docling_ensured.append(True) or True,
+        )
 
         routed = _stub_parse(monkeypatch, app, _doc1())
         await app._dispatch_parse("/tmp/doc1.pdf")
 
-        assert ensured == []  # no worker spawned
+        assert ensured == []  # no per-tab worker spawned
+        assert docling_ensured == []  # no shared docling worker spawned
         assert routed == [("/tmp/doc1.pdf", None)]  # default Celery queue
