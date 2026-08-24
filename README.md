@@ -49,19 +49,31 @@ document ingestion, cross-validation, and agent execution.
                            │ Redis broker + result backend
                            ▼
 ┌─────────────────────────────────────────────────────────────┐
-│        Backend — Celery worker (run_worker.py)               │
-│  sqwakvox.backend.tasks → AppController (controller.py)      │
-│  Docling │ Financial Rule Engine │ any-agent + guardrails    │
+│     Backend — Celery workers (run_worker.py)                 │
+│  ┌───────────────────────────┐   ┌────────────────────────┐ │
+│  │ sqwakvox.docling (×1)     │   │ sqwakvox.doc<N> (×tabs)│ │
+│  │ Docling conversion only   │   │ data store / agent     │ │
+│  │ → AppController           │   │ → AppController        │ │
+│  └───────────────────────────┘   └────────────────────────┘ │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ### Running the backend
 
 You no longer need to start a worker by hand. The TUI spawns and manages its
-own Celery workers automatically: **each document tab gets a dedicated worker
-process on its own queue** (`sqwakvox.doc0`, `sqwakvox.doc1`, ...), so a slow
-Docling parse on one document never blocks chat or cross-validation on
-another. Workers are shut down when the TUI exits, and their logs are written
+own Celery workers automatically:
+
+- **One shared Docling ingest worker** on the `sqwakvox.docling` queue.
+  Document conversion is a one-time ingestion step, so all tabs share a
+  single worker — Docling's heavyweight OCR/layout models load at most a
+  handful of times machine-wide instead of once per open tab.
+- **One agent worker per document tab** on its own queue
+  (`sqwakvox.doc0`, `sqwakvox.doc1`, ...). Data-store, cross-validation, and
+  agent queries run in isolation, so a slow agent call on one document never
+  blocks chat or parsing on another — and a Docling crash only affects the
+  shared ingest worker, which is respawned on the next parse.
+
+Workers are shut down when the TUI exits, and their logs are written
 to `./sqwakvox_workers/`.
 
 ```bash
