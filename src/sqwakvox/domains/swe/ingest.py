@@ -40,8 +40,8 @@ def build_ingest_plan(source: str, options: dict[str, Any] | None = None) -> Ing
         return IngestPlan(kind="single", inputs=[source], metadata={"source_type": "url"})
     if suffix in (".pdf", ".md", ".txt", ".html", ".markdown"):
         return IngestPlan(
-        kind="single", inputs=[source], metadata={"source_type": suffix.lstrip(".")}
-    )
+            kind="single", inputs=[source], metadata={"source_type": suffix.lstrip(".")}
+        )
     return IngestPlan(kind="single", inputs=[source], metadata={"source_type": "file"})
 
 
@@ -62,9 +62,7 @@ def convert(
     return doc
 
 
-def _convert_epub(
-    controller: Any, source: str, is_cancelled: Any
-) -> StructuredDocument | None:
+def _convert_epub(controller: Any, source: str, is_cancelled: Any) -> StructuredDocument | None:
     """Parse an EPUB and convert each chapter (XHTML) with Docling.
 
     Chapters are fed through ``controller.convert_html_string`` so the shared

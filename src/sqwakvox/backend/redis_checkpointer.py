@@ -150,6 +150,47 @@ class RedisCheckpointer(BaseCheckpointSaver[str]):
         return cast(builtins.list[str], self._redis.hkeys(key))
 
     # ------------------------------------------------------------------ #
+    # Tuple assembly (shared by get_tuple / list)
+    # ------------------------------------------------------------------ #
+    def _config(self, thread_id: str, checkpoint_ns: str, checkpoint_id: str) -> RunnableConfig:
+        """Build a RunnableConfig pinned to a specific checkpoint."""
+        return {
+            "configurable": {
+                "thread_id": thread_id,
+                "checkpoint_ns": checkpoint_ns,
+                "checkpoint_id": checkpoint_id,
+            }
+        }
+
+    def _load_parts(self, raw: str) -> tuple[Checkpoint, CheckpointMetadata, str | None]:
+        """Deserialise one stored checkpoint hash value."""
+        return cast(
+            tuple[Checkpoint, CheckpointMetadata, str | None],
+            self._loads(raw),
+        )
+
+    def _tuple_for(
+        self,
+        thread_id: str,
+        checkpoint_ns: str,
+        checkpoint_id: str,
+        parts: tuple[Checkpoint, CheckpointMetadata, str | None],
+    ) -> CheckpointTuple:
+        """Assemble a CheckpointTuple (with pending writes) for a checkpoint."""
+        checkpoint, metadata, parent_checkpoint_id = parts
+        return CheckpointTuple(
+            config=self._config(thread_id, checkpoint_ns, checkpoint_id),
+            checkpoint=checkpoint,
+            metadata=metadata,
+            pending_writes=self._load_writes(thread_id, checkpoint_ns, checkpoint_id),
+            parent_config=(
+                self._config(thread_id, checkpoint_ns, parent_checkpoint_id)
+                if parent_checkpoint_id
+                else None
+            ),
+        )
+
+    # ------------------------------------------------------------------ #
     # Sync API
     # ------------------------------------------------------------------ #
     def get_tuple(self, config: RunnableConfig) -> CheckpointTuple | None:
@@ -157,8 +198,10 @@ class RedisCheckpointer(BaseCheckpointSaver[str]):
         checkpoint_ns: str = config["configurable"].get("checkpoint_ns", "")
         ckpt_key = self._ckpt_key(thread_id, checkpoint_ns)
 
-        if checkpoint_id := get_checkpoint_id(config):
-            raw = self._hget(ckpt_key, checkpoint_id)
+        requested_id = get_checkpoint_id(config)
+        if requested_id:
+            raw = self._hget(ckpt_key, requested_id)
+            checkpoint_id = requested_id
         else:
             ids = self._hkeys(ckpt_key)
             if not ids:
@@ -168,39 +211,12 @@ class RedisCheckpointer(BaseCheckpointSaver[str]):
         if raw is None:
             return None
 
-        checkpoint, metadata, parent_checkpoint_id = cast(
-            tuple[Checkpoint, CheckpointMetadata, str | None],
-            self._loads(raw),
-        )
-        writes = self._load_writes(thread_id, checkpoint_ns, checkpoint_id)
-
-        return CheckpointTuple(
-            config=(
-                config
-                if get_checkpoint_id(config)
-                else {
-                    "configurable": {
-                        "thread_id": thread_id,
-                        "checkpoint_ns": checkpoint_ns,
-                        "checkpoint_id": checkpoint_id,
-                    }
-                }
-            ),
-            checkpoint=checkpoint,
-            metadata=metadata,
-            pending_writes=writes,
-            parent_config=(
-                {
-                    "configurable": {
-                        "thread_id": thread_id,
-                        "checkpoint_ns": checkpoint_ns,
-                        "checkpoint_id": parent_checkpoint_id,
-                    }
-                }
-                if parent_checkpoint_id
-                else None
-            ),
-        )
+        tup = self._tuple_for(thread_id, checkpoint_ns, checkpoint_id, self._load_parts(raw))
+        if requested_id:
+            # The caller asked for a specific checkpoint: echo their exact
+            # config object back instead of our reconstructed one.
+            return tup._replace(config=config)
+        return tup
 
     def list(
         self,
@@ -244,38 +260,13 @@ class RedisCheckpointer(BaseCheckpointSaver[str]):
                     raw = self._hget(self._ckpt_key(thread_id, checkpoint_ns), checkpoint_id)
                     if raw is None:
                         continue
-                    checkpoint, metadata, parent_checkpoint_id = cast(
-                        tuple[Checkpoint, CheckpointMetadata, str | None],
-                        self._loads(raw),
-                    )
+                    parts = self._load_parts(raw)
                     if filter and not all(
-                        query_value == metadata.get(query_key)
+                        query_value == parts[1].get(query_key)
                         for query_key, query_value in filter.items()
                     ):
                         continue
-                    yield CheckpointTuple(
-                        config={
-                            "configurable": {
-                                "thread_id": thread_id,
-                                "checkpoint_ns": checkpoint_ns,
-                                "checkpoint_id": checkpoint_id,
-                            }
-                        },
-                        checkpoint=checkpoint,
-                        metadata=metadata,
-                        pending_writes=self._load_writes(thread_id, checkpoint_ns, checkpoint_id),
-                        parent_config=(
-                            {
-                                "configurable": {
-                                    "thread_id": thread_id,
-                                    "checkpoint_ns": checkpoint_ns,
-                                    "checkpoint_id": parent_checkpoint_id,
-                                }
-                            }
-                            if parent_checkpoint_id
-                            else None
-                        ),
-                    )
+                    yield self._tuple_for(thread_id, checkpoint_ns, checkpoint_id, parts)
                     if limit is not None:
                         limit -= 1
                         if limit <= 0:
@@ -300,13 +291,7 @@ class RedisCheckpointer(BaseCheckpointSaver[str]):
                 (checkpoint, get_checkpoint_metadata(config, metadata), parent_checkpoint_id)
             ),
         )
-        return {
-            "configurable": {
-                "thread_id": thread_id,
-                "checkpoint_ns": checkpoint_ns,
-                "checkpoint_id": checkpoint_id,
-            }
-        }
+        return self._config(thread_id, checkpoint_ns, checkpoint_id)
 
     def put_writes(
         self,

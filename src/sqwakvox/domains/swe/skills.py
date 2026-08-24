@@ -65,9 +65,7 @@ def read_skill(name: str, domain_id: str = "swe") -> str | None:
         return None
 
 
-def create_skill(
-    name: str, description: str, content: str, domain_id: str = "swe"
-) -> Path:
+def create_skill(name: str, description: str, content: str, domain_id: str = "swe") -> Path:
     """Create (or overwrite) a skill file, validating name, size, and secrets."""
     _validate_skill(name, description, content)
     path = skill_path(domain_id, name)
@@ -76,9 +74,7 @@ def create_skill(
     return path
 
 
-def update_skill(
-    name: str, description: str, content: str, domain_id: str = "swe"
-) -> Path:
+def update_skill(name: str, description: str, content: str, domain_id: str = "swe") -> Path:
     """Update an existing skill (same validation as create)."""
     if not skill_path(domain_id, name).exists():
         raise ValueError(f"Skill '{name}' does not exist")
@@ -100,9 +96,7 @@ def search_skills(query: str, domain_id: str = "swe") -> list[dict[str, str]]:
     """Filter skills by a case-insensitive match on name or description."""
     q = query.lower()
     return [
-        s
-        for s in list_skills(domain_id)
-        if q in s["name"].lower() or q in s["description"].lower()
+        s for s in list_skills(domain_id) if q in s["name"].lower() or q in s["description"].lower()
     ]
 
 

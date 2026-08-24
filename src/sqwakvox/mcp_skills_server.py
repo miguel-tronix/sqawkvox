@@ -69,8 +69,7 @@ def list_skills() -> str:
 @mcp.tool(
     name="read_skill",
     description=(
-        "Read the full content of a skill by name. Use before following or "
-        "editing a skill."
+        "Read the full content of a skill by name. Use before following or editing a skill."
     ),
 )
 def read_skill(name: str) -> str:

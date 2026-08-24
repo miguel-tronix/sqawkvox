@@ -88,9 +88,10 @@ class DocumentDomain:
     #: shared docling worker where the Docling models already live.
     pre_convert: Callable[[str, dict[str, Any]], IngestPlan] | None = None
     #: Convert a planned source into a StructuredDocument (runs in the worker).
-    convert: Callable[
-        [Controller, str, IngestPlan, Callable[[], bool]], StructuredDocument | None
-    ] | None = None
+    convert: (
+        Callable[[Controller, str, IngestPlan, Callable[[], bool]], StructuredDocument | None]
+        | None
+    ) = None
     #: Post-parse processing (runs on the per-document agent worker).
     #: Returns a JSON-serialisable payload, e.g. ``{"data_store": {...}}``.
     postprocess: Callable[[StructuredDocument, str], dict[str, Any]] | None = None
