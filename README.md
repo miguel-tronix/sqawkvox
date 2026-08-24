@@ -1,4 +1,4 @@
-# Sqwakvox — Local AI Financial Document Assistant
+# Sqwakvox — Local AI Multi-Document Assistant
 
 ```
 ███████╗ ██████╗ ██╗    ██╗ █████╗ ██╗  ██╗██╗   ██╗ ██████╗ ██╗  ██╗
@@ -12,18 +12,23 @@
 [![Python 3.12+](https://img.shields.io/badge/python-3.12%2B-blue)](https://python.org)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
 
-Sqwakvox is a terminal user interface application for financial document analysis. It uses IBM Docling to read PDF files and render tables with sparkline trends. It connects to language models through Mozilla any-agent. It includes prompt guardrails, PII redaction, and numerical cross-validation.
+Sqwakvox is a terminal user interface application for **document analysis with multiple expert assistants**. It uses IBM Docling to read documents (PDFs, EPUBs, URLs), connects to language models through Mozilla any-agent, and runs domain-specific guardrails, rendering, and tools.
+
+- **Financial** — tables, sparkline trends, numerical cross-validation, calc-stats MCP tools.
+- **Software Engineering (SWE)** — library docs, PDF/EPUB engineering books (e.g. Martin Fowler); builds TOC + code-block indexes and can author reusable **skill files** during a chat.
 
 ![Screenshot](screenshots/SqwakvoxApp_2026-05-26T11_26_35_185726.svg)
 
 ## Features
 
 - **3-Pane TUI**: The interface has a sidebar, a document render pane, and a chat log.
-- **Docling Integration**: The application parses local PDF files and remote URLs. It exports table data to dataframes.
+- **Multiple expert types**: Pick the "Agent Expert Type" when loading a document; each tab keeps its own domain (prompts, guardrails, rendering, tools).
+- **Docling Integration**: The application parses local PDF/EPUB/Markdown files and remote URLs.
 - **Multi-Model Support**: The application connects to OpenAI, Anthropic, Mistral, and Gemini models.
 - **Input Guardrails**: Mozilla `any-guardrail` blocks prompt injection attacks before queries reach the model.
 - **PII Redaction**: The system redacts Social Security numbers, credit cards, bank accounts, and email addresses.
 - **Financial Cross-Validation**: The rule engine extracts numeric table values and verifies calculated results.
+- **SWE skills**: The SWE assistant can create/read/update reusable `SKILL.md` files (YAML frontmatter) under `./skills/swe/<name>/` via its skills MCP tools.
 - **OpenTelemetry Instrumentation**: The system records traces and metrics for document processing, agent execution, and tool calls.
 - **Unicode Table Rendering**: The application displays double borders, automatic column alignment, and numeric sparklines.
 - **Audit Logging**: The application writes events to an append-only JSONL audit log.
@@ -33,7 +38,9 @@ Sqwakvox is a terminal user interface application for financial document analysi
 Sqwakvox uses a model-view-presenter (MVP) layout decoupled by Celery. The
 Textual TUI (view) never blocks on heavy work — it submits Celery tasks through
 the presenter and polls for progress, while a separate worker process runs
-document ingestion, cross-validation, and agent execution.
+document ingestion, post-processing, and agent execution.
+
+Domains are declared in the registry (`sqwakvox/domains/`) — a `DocumentDomain` profile carries its prompts, ingest plan, post-parse processing, guardrail pipeline, renderer, tool set, and skills storage. Adding a new assistant is registering a new domain; the core never changes.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -121,10 +128,33 @@ sqwakvox
 Follow these steps to analyze a document:
 
 1. If you have a local file or URL, enter the path in the input field or click the browse button.
-2. Select a model provider from the dropdown menu.
-3. Enter your API key for the selected provider.
-4. Click **Load & Parse** to extract layout, text, and tables.
-5. Enter a question in the chat input.
+2. Pick the **Agent Expert Type** for the document: *Financial* or *Software Engineering*.
+3. Select a model provider from the dropdown menu.
+4. Enter your API key for the selected provider.
+5. Click **Load & Parse** to extract layout, text, and tables (PDF/EPUB/Markdown/URL).
+6. Enter a question in the chat input.
+
+### Document assistants (domains)
+
+Each loaded document is tagged with the expert type you selected, and tabs of
+different domains can coexist. The domain controls the agent's system prompt,
+the guardrail pipeline, how the document renders, and which MCP tools are
+attached (`domains` tag in `mcp_servers.json`; untagged servers are global):
+
+| Domain | Sources | Extras |
+|---|---|---|
+| Financial | PDF, tables | math cross-validation, sparklines, calc-stats tools |
+| SWE | PDF, **EPUB**, docs URLs, Markdown | TOC + code-block index, injection scan, secret redaction, **skills** |
+
+#### SWE skills
+
+The SWE assistant can create reusable skills during a chat (ask it to "save
+that as a skill"): it uses the `skills` MCP server to write standard
+`SKILL.md` files (YAML frontmatter: `name`, `description`) under
+`./skills/swe/<skill-name>/` in the current directory — the same convention
+as `.agents/skills/`. Stored skills appear in the sidebar's **Skills** pane
+and are reusable by any tooling that reads that format. Override the root
+with `SQWAKVOX_SKILLS_DIR`.
 
 ### Keybindings
 

@@ -118,43 +118,19 @@ class DocumentRenderPane(VerticalScroll):
     def compose(self) -> ComposeResult:
         yield Static(id="render-pane-content")
 
-    def update_document(self, doc: StructuredDocument) -> None:
+    def update_document(self, doc: StructuredDocument, domain_id: str = "financial") -> None:
+        """Render *doc* using its domain's renderer (see :mod:`sqwakvox.domains`)."""
+        from sqwakvox.domains import get_domain
+
         content_pane = self.query_one("#render-pane-content", Static)
-        content: list[str] = []
-        content.append(f"[bold]{doc.file_name}[/bold]\n")
-
-        if doc.raw_markdown:
-            content.append(doc.raw_markdown)
-
-        for table in doc.tables:
-            title = table.title or "Financial Data"
-            content.append(f"\n[bold underline]{title}[/bold underline]\n")
-            content.append(UnicodeTableFormatter.format_table(table))
-
-            numeric_values = self._extract_numeric_column(table)
-            if numeric_values:
-                spark = TerminalChartPlotter.render_sparkline(numeric_values)
-                if spark:
-                    content.append(f"\nTrend: {spark}")
-
-        content_pane.update("\n".join(content))
+        domain = get_domain(domain_id)
+        render_fn = domain.render
+        content = render_fn(doc) if render_fn is not None else self._fallback_render(doc)
+        content_pane.update(content)
 
     @staticmethod
-    def _extract_numeric_column(table: TableData) -> list[float]:
-        if not table.rows:
-            return []
-        for col_idx in range(min(len(table.rows[0]), len(table.headers))):
-            try:
-                values = [
-                    float(row[col_idx].replace("$", "").replace(",", "").replace("%", ""))
-                    for row in table.rows
-                    if col_idx < len(row)
-                ]
-            except ValueError:
-                continue
-            if values:
-                return values
-        return []
+    def _fallback_render(doc: StructuredDocument) -> str:
+        return f"[bold]{doc.file_name}[/bold]\n\n{doc.raw_markdown or ''}"
 
     def clear_document(self) -> None:
         self.query_one("#render-pane-content", Static).update("")
