@@ -3,17 +3,26 @@
     "calc-stats": {
       "command": ".venv/bin/python",
       "args": ["-m", "sqwakvox.mcp_calc_server"],
-      "client_session_timeout_seconds": 300
+      "client_session_timeout_seconds": 300,
+      "domains": ["financial"]
     },
     "calc-stats-http": {
       "url": "http://127.0.0.1:8000/sse",
       "transport": "sse",
-      "client_session_timeout_seconds": 300
+      "client_session_timeout_seconds": 300,
+      "domains": ["financial"]
+    },
+    "skills": {
+      "command": ".venv/bin/python",
+      "args": ["-m", "sqwakvox.mcp_skills_server"],
+      "client_session_timeout_seconds": 300,
+      "domains": ["swe"]
     },
     "fetch": {
       "command": "uvx",
       "args": ["--with", "mcp<2.0", "mcp-server-fetch"],
-      "client_session_timeout_seconds": 300
+      "client_session_timeout_seconds": 300,
+      "domains": ["swe"]
     },
     "sqlite": {
       "command": "uvx",

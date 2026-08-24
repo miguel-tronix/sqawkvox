@@ -209,6 +209,7 @@ class Presenter:
         self,
         source: str,
         *,
+        domain_id: str = "financial",
         queue: str | None = None,
         on_progress: Callable[[TaskStatus, Any], None] | None = None,
         on_complete: Callable[[TaskStatus, StructuredDocument | None], None] | None = None,
@@ -231,9 +232,28 @@ class Presenter:
         return await self.submit_task(
             "convert_document",
             args=[source],
+            kwargs={"domain_id": domain_id},
             queue=queue,
             on_progress=on_progress,
             on_complete=_on_complete,
+            on_error=on_error,
+        )
+
+    async def postprocess_document(
+        self,
+        domain_id: str,
+        document: StructuredDocument,
+        *,
+        queue: str | None = None,
+        on_complete: Callable[[TaskStatus, dict[str, Any]], None] | None = None,
+        on_error: Callable[[str], None] | None = None,
+    ) -> TaskHandle:
+        """Run the active domain's post-parse step (data store, TOC, ...)."""
+        return await self.submit_task(
+            "domain_postprocess",
+            args=[domain_id, document.model_dump()],
+            queue=queue,
+            on_complete=on_complete,
             on_error=on_error,
         )
 
@@ -245,6 +265,7 @@ class Presenter:
         on_complete: Callable[[TaskStatus, dict[str, str]], None] | None = None,
         on_error: Callable[[str], None] | None = None,
     ) -> TaskHandle:
+        """Financial-domain data store (kept for backward compatibility)."""
         return await self.submit_task(
             "build_financial_data_store",
             args=[document.model_dump()],
@@ -282,6 +303,7 @@ class Presenter:
         data_store: dict[str, str],
         mcp_servers: list[dict[str, Any]] | None = None,
         thread_id: str | None = None,
+        domain_id: str = "financial",
         *,
         queue: str | None = None,
         on_progress: Callable[[TaskStatus, Any], None] | None = None,
@@ -309,6 +331,7 @@ class Presenter:
                 mcp_servers,
                 thread_id,
             ],
+            kwargs={"domain_id": domain_id},
             queue=queue,
             on_progress=on_progress,
             on_complete=_on_complete,

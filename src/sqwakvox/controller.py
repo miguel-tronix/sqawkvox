@@ -11,12 +11,12 @@ from typing import TYPE_CHECKING, Any
 
 from billiard.exceptions import SoftTimeLimitExceeded  # type: ignore[import-untyped]
 
+from sqwakvox.domains import get_domain
+from sqwakvox.domains.base import GuardrailPipeline, InputGuardrailResult, OutputGuardrailResult
 from sqwakvox.guardrails import (
-    AnyGuardrailValidator,
     AuditLogger,
     FinancialRuleEngine,
     FinancialValue,
-    PIIRedactor,
     detect_unit,
     parse_financial_value,
 )
@@ -136,7 +136,10 @@ class AppController:
         self._converter = value
 
     def convert_document(
-        self, source: str, is_cancelled: Callable[[], bool]
+        self,
+        source: str,
+        is_cancelled: Callable[[], bool],
+        domain_id: str = "financial",
     ) -> StructuredDocument | None:
         tm = get_telemetry()
         start_time = time.monotonic()
@@ -148,7 +151,7 @@ class AppController:
                     logger.info("Docling parsing worker was cancelled.")
                     span.set_attribute("cancelled", True)
                     if tm.doc_ingest_counter:
-                        tm.doc_ingest_counter.add(1, {"status": "cancelled"})
+                        tm.doc_ingest_counter.add(1, {"status": "cancelled", "domain": domain_id})
                     return None
                 logger.info("Docling layout conversion complete. Processing tables...")
 
@@ -214,6 +217,7 @@ class AppController:
                     file_name=doc_name,
                     raw_markdown=doc_md,
                     tables=tables,
+                    metadata={"domain_id": domain_id},
                 )
 
                 duration = time.monotonic() - start_time
@@ -221,11 +225,14 @@ class AppController:
                 span.set_attribute("tables_count", len(tables))
                 span.set_attribute("markdown_length", len(doc_md))
                 span.set_attribute("duration_sec", duration)
+                span.set_attribute("domain_id", domain_id)
 
                 if tm.doc_ingest_counter:
-                    tm.doc_ingest_counter.add(1, {"status": "success"})
+                    tm.doc_ingest_counter.add(1, {"status": "success", "domain": domain_id})
                 if tm.doc_ingest_duration:
-                    tm.doc_ingest_duration.record(duration, {"status": "success"})
+                    tm.doc_ingest_duration.record(
+                        duration, {"status": "success", "domain": domain_id}
+                    )
                 if tm.doc_markdown_length:
                     tm.doc_markdown_length.record(len(doc_md))
                 if tm.doc_tables_count:
@@ -252,10 +259,32 @@ class AppController:
                     raise timeout_exc from None
                 duration = time.monotonic() - start_time
                 if tm.doc_ingest_counter:
-                    tm.doc_ingest_counter.add(1, {"status": "failure"})
+                    tm.doc_ingest_counter.add(1, {"status": "failure", "domain": domain_id})
                 if tm.doc_ingest_duration:
-                    tm.doc_ingest_duration.record(duration, {"status": "failure"})
+                    tm.doc_ingest_duration.record(
+                        duration, {"status": "failure", "domain": domain_id}
+                    )
                 raise
+
+    def convert_html_string(
+        self,
+        content: str,
+        name: str,
+        is_cancelled: Callable[[], bool],
+    ) -> str:
+        """Convert an HTML string (e.g. an EPUB chapter) to markdown.
+
+        Used by domains that assemble multi-part sources (EPUB chapters,
+        crawled docs pages) inside the shared docling worker.
+        """
+        from docling.datamodel.base_models import InputFormat
+
+        with trace_span("sqwakvox.document.convert_html", {"name": name}):
+            result = self.converter.convert_string(content, format=InputFormat.HTML, name=name)
+            if is_cancelled():
+                logger.info("Docling HTML conversion was cancelled.")
+                return ""
+            return result.document.export_to_markdown()
 
     def build_financial_data_store(
         self, structured_doc: StructuredDocument | None
@@ -338,7 +367,13 @@ class AppController:
         data_store: Mapping[str, float | FinancialValue],
         mcp_servers: list[Any] | None = None,
         thread_id: str | None = None,
+        domain_id: str = "financial",
     ) -> AgentResult:
+        """Run the agent for *domain_id*'s guardrail pipeline and prompts."""
+        domain = get_domain(domain_id)
+        pipeline: GuardrailPipeline = (
+            domain.guardrail_pipeline() if domain.guardrail_pipeline else GuardrailPipeline()
+        )
         tm = get_telemetry()
         start_time = time.monotonic()
         with trace_span(
@@ -348,30 +383,38 @@ class AppController:
                 "document": active_document_name,
                 "user_query_len": len(user_query),
                 "doc_context_len": len(doc_context),
+                "domain_id": domain_id,
             },
         ) as span:
             result = AgentResult()
 
-            # 1. Mozilla any-guardrail Input Prompt Verification
-            is_query_safe = AnyGuardrailValidator.validate_prompt(user_query)
-            if not is_query_safe:
+            # 1. Domain input guardrails (prompt safety + PII redaction).
+            input_res: InputGuardrailResult = (
+                pipeline.validate_input(user_query)
+                if pipeline.validate_input
+                else InputGuardrailResult()
+            )
+            if not input_res.safe:
                 result.is_blocked = True
-                result.blocked_reason = "Mozilla any-guardrail prompt safety violation"
+                result.blocked_reason = (
+                    input_res.blocked_reason or "Input guardrail blocked the query"
+                )
                 result.success = False
                 span.set_attribute("is_blocked", True)
                 span.set_attribute("status", "blocked")
 
                 duration = time.monotonic() - start_time
                 if tm.agent_execution_counter:
-                    tm.agent_execution_counter.add(1, {"model_id": model_id, "status": "blocked"})
+                    tm.agent_execution_counter.add(
+                        1, {"model_id": model_id, "status": "blocked", "domain": domain_id}
+                    )
                 if tm.agent_execution_duration:
                     tm.agent_execution_duration.record(
-                        duration, {"model_id": model_id, "status": "blocked"}
+                        duration, {"model_id": model_id, "status": "blocked", "domain": domain_id}
                     )
                 return result
 
-            # 2. Local PII Redaction
-            redacted_query = PIIRedactor.redact_text(user_query)
+            redacted_query = input_res.text if input_res.text is not None else user_query
             if redacted_query != user_query:
                 result.pii_redacted_query = True
 
@@ -381,6 +424,7 @@ class AppController:
                 guardrail_checks={
                     "any_guardrail_safe": True,
                     "pii_redacted": result.pii_redacted_query,
+                    "domain_id": domain_id,
                 },
                 action="ALLOWED",
                 input_text=user_query,
@@ -399,24 +443,24 @@ class AppController:
                     env_var=env_var,
                     mcp_servers=mcp_servers,
                     thread_id=thread_id,
+                    domain_id=domain_id,
                 )
 
                 logger.info("Agent raw response received: %d chars", len(agent_response))
 
-                # 3. Output PII Redaction
-                agent_redacted = PIIRedactor.redact_text(agent_response)
-                if agent_redacted != agent_response:
-                    result.pii_redacted_response = True
-
-                # 4. Math Guardrail Validation
-                verification = FinancialRuleEngine.cross_check_text_assertions(
-                    agent_redacted, data_store
+                # 2. Domain output guardrails (PII redaction, math checks,
+                #    secret redaction — depends on the domain's pipeline).
+                output_res: OutputGuardrailResult = (
+                    pipeline.validate_output(agent_response, dict(data_store))
+                    if pipeline.validate_output
+                    else OutputGuardrailResult()
                 )
+                final_text = output_res.text if output_res.text is not None else agent_response
+                if final_text != agent_response:
+                    result.pii_redacted_response = True
+                result.math_discrepancies = output_res.warnings
 
-                if not verification.passed:
-                    result.math_discrepancies = verification.discrepancies
-
-                result.response = agent_redacted
+                result.response = final_text
                 logger.info(
                     "Agent result prepared: success=%s, len=%d",
                     result.success,
@@ -453,10 +497,12 @@ class AppController:
             span.set_attribute("duration_sec", duration)
 
             if tm.agent_execution_counter:
-                tm.agent_execution_counter.add(1, {"model_id": model_id, "status": status_str})
+                tm.agent_execution_counter.add(
+                    1, {"model_id": model_id, "status": status_str, "domain": domain_id}
+                )
             if tm.agent_execution_duration:
                 tm.agent_execution_duration.record(
-                    duration, {"model_id": model_id, "status": status_str}
+                    duration, {"model_id": model_id, "status": status_str, "domain": domain_id}
                 )
             if result.success and tm.agent_response_length:
                 tm.agent_response_length.record(len(result.response))

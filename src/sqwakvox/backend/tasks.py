@@ -1,12 +1,17 @@
 """Celery tasks for the Sqwakvox backend.
 
 Each task wraps a synchronous, CPU/IO-bound operation from
-:class:`~sqwakvox.controller.AppController`.  Keeping them as plain functions
-with explicit arguments (no model-bound objects that can't be JSON-serialised
-through the broker) ensures Celery can always pickle the call graph.
+:class:`~sqwakvox.controller.AppController` (or a domain hook).  Keeping them
+as plain functions with explicit arguments (no model-bound objects that can't
+be JSON-serialised through the broker) ensures Celery can always pickle the
+call graph.
 
 The presenter talks to these tasks via ``AsyncResult`` polling.  Every task
 returns a JSON-serialisable result (Pydantic ``model_dump`` for documents).
+
+Tasks are domain-agnostic: ``domain_id`` (see :mod:`sqwakvox.domains`)
+selects the ingest plan, post-parse payload, and guardrail pipeline.  Unknown
+ids fall back to the financial domain, so old queued messages keep working.
 """
 
 from __future__ import annotations
@@ -20,6 +25,8 @@ from pydantic import TypeAdapter
 
 from sqwakvox.backend.celery_app import celery_app  # noqa: F401 — registers tasks
 from sqwakvox.controller import AgentResult, AppController
+from sqwakvox.domains import get_domain
+from sqwakvox.domains.base import IngestPlan
 from sqwakvox.guardrails import FinancialValue
 from sqwakvox.models import StructuredDocument
 
@@ -40,38 +47,75 @@ def _get_controller() -> AppController:
     return AppController()
 
 
+def _is_revoked(self: Any) -> bool:
+    """Return whether the running task was revoked (backend may be absent)."""
+    try:
+        return bool(self.is_revoked())
+    except Exception:
+        return False
+
+
 @shared_task(bind=True, name="sqwakvox.backend.tasks.convert_document")  # type: ignore[untyped-decorator]
-def convert_document(self: Any, source: str) -> dict[str, Any] | None:
+def convert_document(
+    self: Any,
+    source: str,
+    domain_id: str = "financial",
+    options: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Parse *source* (path/URL) into a :class:`StructuredDocument`.
 
-    Returns the document as a plain dict (``model_dump``) so it can travel
-    through the result backend, or ``None`` if the worker was revoked.
+    The domain's ingest plan decides how Docling is fed (EPUB chapters,
+    single PDF/URL, ...) and how the result is reassembled.  Returns the
+    document as a plain dict (``model_dump``), or ``None`` if the worker was
+    revoked.
     """
     controller = _get_controller()
     task_id = self.request.id
 
     # A revocation sentinel: if the task was revoked before we even started
     # running, Celery will still call the body.  Check explicitly.
-    # ``is_revoked`` requires a result backend, so guard against environments
-    # where it's unavailable (e.g. eager mode without a broker).
-    try:
-        revoked = bool(self.is_revoked())
-    except Exception:
-        revoked = False
-    if revoked:
+    if _is_revoked(self):
         logger.info("convert_document %s revoked before start", task_id)
         return None
 
     def is_cancelled() -> bool:
-        try:
-            return bool(self.is_revoked())
-        except Exception:
-            return False
+        return _is_revoked(self)
 
-    doc = controller.convert_document(source, is_cancelled)
+    domain = get_domain(domain_id)
+    plan: IngestPlan = (
+        domain.pre_convert(source, options or {})
+        if domain.pre_convert
+        else IngestPlan(kind="single", inputs=[source])
+    )
+    convert_fn = domain.convert
+    doc = (
+        controller.convert_document(source, is_cancelled, domain_id=domain_id)
+        if convert_fn is None
+        else convert_fn(controller, source, plan, is_cancelled)
+    )
     if doc is None:
         return None
+    doc.metadata["domain_id"] = domain_id
     return doc.model_dump()
+
+
+@shared_task(bind=True, name="sqwakvox.backend.tasks.domain_postprocess")  # type: ignore[untyped-decorator]
+def domain_postprocess(
+    self: Any,  # noqa: ARG001
+    domain_id: str,
+    document_dump: dict[str, Any],
+    source: str = "",
+) -> dict[str, Any]:
+    """Run a domain's post-parse processing on a parsed document.
+
+    Returns a domain-defined, JSON-serialisable payload — financial:
+    ``{"data_store": {...}}``; swe: TOC + code-block index + injection flags.
+    """
+    doc = StructuredDocument.model_validate(document_dump)
+    domain = get_domain(domain_id)
+    if domain.postprocess is None:
+        return {}
+    return domain.postprocess(doc, source)
 
 
 @shared_task(bind=True, name="sqwakvox.backend.tasks.build_financial_data_store")  # type: ignore[untyped-decorator]
@@ -79,19 +123,18 @@ def build_financial_data_store(
     self: Any,  # noqa: ARG001
     document_dump: dict[str, Any],
 ) -> dict[str, str]:
-    """Return a JSON-serialisable mapping ``{label: raw_str}``.
+    """Return the financial data store ``{label: raw_str}``.
 
-    ``FinancialValue`` is a float subclass; we serialise it back to its raw
-    string form so the presenter can hand it to the guardrail layer verbatim.
+    Backward-compatible wrapper over the financial domain's post-parse step
+    (used by the TUI's older data-store flow and existing tests).
     """
-    controller = _get_controller()
+    from typing import cast
+
+    from sqwakvox.domains.financial import _postprocess
+
     doc = StructuredDocument.model_validate(document_dump)
-    data_store = controller.build_financial_data_store(doc)
-    # Serialise to {label: raw_str} for broker-safe transport.
-    return {
-        label: str(value.raw_str if hasattr(value, "raw_str") else value)
-        for label, value in data_store.items()
-    }
+    payload = _postprocess(doc)
+    return cast(dict[str, str], payload.get("data_store", {}))
 
 
 @shared_task(bind=True, name="sqwakvox.backend.tasks.cross_validate")  # type: ignore[untyped-decorator]
@@ -116,20 +159,18 @@ def execute_agent(
     data_store: dict[str, str],
     mcp_servers: list[dict[str, Any]] | None,
     thread_id: str | None = None,
+    domain_id: str = "financial",
 ) -> dict[str, Any] | AgentResult:
     """Execute the LLM agent for a user chat query.
 
     ``mcp_servers`` is a broker-safe ``model_dump()`` list of any_agent MCP
     configs; we rehydrate them back into ``MCPParams`` here before handing
-    them to the controller.
+    them to the controller.  ``domain_id`` selects the agent prompts and the
+    guardrail pipeline.
     """
     controller = _get_controller()
 
-    try:
-        revoked = self.is_revoked()
-    except Exception:
-        revoked = False
-    if revoked:
+    if _is_revoked(self):
         result = AgentResult(
             success=False,
             error_message="Agent task was cancelled before it started executing.",
@@ -156,5 +197,6 @@ def execute_agent(
         data_store=hydrated_store,
         mcp_servers=hydrated_mcp,
         thread_id=thread_id,
+        domain_id=domain_id,
     )
     return result.__dict__ if hasattr(result, "__dict__") else result

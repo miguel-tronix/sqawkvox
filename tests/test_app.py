@@ -1,5 +1,5 @@
 import pytest
-from textual.widgets import ListView, Tab, Tabs
+from textual.widgets import ListView, Select, Tab, Tabs
 
 from sqwakvox.app import SqwakvoxApp
 from sqwakvox.models import StructuredDocument
@@ -181,3 +181,73 @@ async def test_managed_workers_disabled_falls_back_to_default_queue(
         assert ensured == []  # no per-tab worker spawned
         assert docling_ensured == []  # no shared docling worker spawned
         assert routed == [("/tmp/doc1.pdf", None)]  # default Celery queue
+
+
+def _stub_parse_with_domain(
+    monkeypatch: pytest.MonkeyPatch, app: SqwakvoxApp, doc: StructuredDocument
+) -> list[tuple[str, str | None, str]]:
+    """Like _stub_parse, but also captures the domain_id passed to parse_document."""
+    routed: list[tuple[str, str | None, str]] = []
+
+    class FakeHandle:
+        status = TaskStatus.SUCCESS
+        result = None
+        error = None
+
+        async def wait(self, _timeout: float | None = None) -> TaskStatus:
+            return TaskStatus.SUCCESS
+
+    async def fake_parse(source: str, **kwargs):
+        routed.append((source, kwargs.get("queue"), kwargs.get("domain_id", "financial")))
+        if kwargs.get("on_complete") is not None:
+            kwargs["on_complete"](TaskStatus.SUCCESS, doc)
+        return FakeHandle()
+
+    monkeypatch.setattr(app.presenter, "parse_document", fake_parse)
+    return routed
+
+
+@pytest.mark.asyncio
+async def test_swe_domain_selection_routes_parse_and_domain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Selecting the SWE expert type must route the parse with domain_id='swe'
+    and tag the loaded document so chat/rendering use the SWE domain."""
+    app = SqwakvoxApp()
+    async with app.run_test() as pilot:
+        ensured: list[str] = []
+        monkeypatch.setattr(
+            app.worker_manager,
+            "ensure_worker",
+            lambda queue, **_kwargs: ensured.append(queue) or True,
+        )
+        monkeypatch.setattr(
+            app.worker_manager,
+            "ensure_docling_worker",
+            lambda: True,
+        )
+
+        # Select Software Engineering in the sidebar.
+        selector = app.query_one("#domain-selector", Select)
+        selector.value = "swe"
+        await pilot.pause()
+
+        routed = _stub_parse_with_domain(monkeypatch, app, _doc1())
+        await app._dispatch_parse("/tmp/book.epub", "swe")
+
+        assert routed == [("/tmp/book.epub", "sqwakvox.docling", "swe")]
+        assert app._doc_domains["/tmp/book.epub"] == "swe"
+
+        # The loaded document keeps its domain for chat dispatch + rendering.
+        assert app._active_domain_id() == "swe"
+        loaded = app.loaded_documents["/tmp/book.epub"]
+        assert loaded.domain_id == "swe"
+        assert loaded.file_name == "doc1.pdf"
+
+
+@pytest.mark.asyncio
+async def test_active_domain_defaults_to_financial() -> None:
+    """Before any document loads, the active domain is financial."""
+    app = SqwakvoxApp()
+    async with app.run_test():
+        assert app._active_domain_id() == "financial"
