@@ -31,6 +31,9 @@ from textual.widgets import (
 from textual.worker import Worker
 
 from sqwakvox.controller import AgentResult, extract_message
+from sqwakvox.domains import get_domain, list_domains
+from sqwakvox.domains.base import LoadedDocument
+from sqwakvox.domains.swe import skills as swe_skills
 from sqwakvox.guardrails import AuditLogger
 from sqwakvox.models import ModelProvider, StructuredDocument
 from sqwakvox.presenter import Presenter, TaskStatus
@@ -269,11 +272,14 @@ class SqwakvoxApp(App[None]):
         self.doc_context: str = ""
         self.structured_doc: StructuredDocument | None = None
         self.ingestion_history: list[str] = []
-        self.loaded_documents: dict[str, StructuredDocument] = {}
+        self.loaded_documents: dict[str, LoadedDocument] = {}
+        #: Source → domain_id chosen at load time (the "Agent Expert Type").
+        self._doc_domains: dict[str, str] = {}
         self.chat_histories: dict[str, list[str]] = {}
         self._chat_log_dir = Path.home() / ".sqwakvox_chat_logs"
         self._chat_log_dir.mkdir(parents=True, exist_ok=True)
-        self.mcp_configs: list[tuple[str, Any]] = []
+        #: MCP servers as ``(name, config, domains | None)`` (see _load_mcp_servers).
+        self.mcp_configs: list[tuple[str, Any, list[str] | None]] = []
         # Per-document-tab Celery queues and their managed workers.  Each
         # loaded document gets its own queue (``sqwakvox.doc<N>``) served by
         # a dedicated worker subprocess, so a slow agent query on one tab
@@ -323,6 +329,21 @@ class SqwakvoxApp(App[None]):
             return None
         return self._doc_queues.get(source)
 
+    def _active_domain_id(self) -> str:
+        """Domain of the currently active document (financial fallback)."""
+        source = self._active_source()
+        if source is None:
+            return "financial"
+        return self._doc_domains.get(source, "financial")
+
+    def _selected_domain(self) -> str:
+        """Domain chosen in the sidebar's Agent Expert Type selector."""
+        try:
+            value = self.query_one("#domain-selector", Select).value
+        except Exception:
+            return "financial"
+        return str(value) if value else "financial"
+
     def on_unmount(self) -> None:
         """Stop all managed worker subprocesses when the TUI shuts down."""
         self.worker_manager.stop_all()
@@ -338,6 +359,12 @@ class SqwakvoxApp(App[None]):
                     id="doc-source",
                 )
                 yield Button("📁", id="btn-browse", variant="default")
+            yield Label("Agent Expert Type:")
+            yield Select(
+                options=[(d.display_name, d.domain_id) for d in list_domains()],
+                value="financial",
+                id="domain-selector",
+            )
             yield Button("Load & Parse", variant="primary", id="btn-parse")
 
             yield Label("[bold]Model Configuration[/bold]", id="model-config-label")
@@ -359,6 +386,9 @@ class SqwakvoxApp(App[None]):
 
             yield Label("[bold]MCP Servers[/bold]", id="mcp-servers-label")
             yield ListView(id="mcp-servers-list")
+
+            yield Label("[bold]Skills[/bold]", id="skills-label")
+            yield ListView(id="skills-list")
 
             yield Label("[bold]Ingest History[/bold]", id="history-label")
             yield ListView(id="ingest-history")
@@ -394,6 +424,7 @@ class SqwakvoxApp(App[None]):
     def on_mount(self) -> None:
         self._update_ui_state()
         self._load_mcp_servers()
+        self._refresh_skills_list()
 
     def _load_mcp_servers(self) -> None:
         """Load MCP servers config from standard locations.
@@ -459,7 +490,8 @@ class SqwakvoxApp(App[None]):
                             continue
 
                         if mcp_opt is not None:
-                            self.mcp_configs.append((name, mcp_opt))
+                            domains_tag = srv.get("domains")
+                            self.mcp_configs.append((name, mcp_opt, domains_tag))
                     break
                 except Exception as e:
                     logger.error("Error loading MCP servers from %s: %s", path, e)
@@ -477,13 +509,52 @@ class SqwakvoxApp(App[None]):
                 )
             )
         else:
-            for name, config in self.mcp_configs:
+            for name, config, _domains in self.mcp_configs:
                 list_view.append(
                     ListItem(
                         Label(f"🟢 [bold]{name}[/bold] ({config.command})"),
                         id=f"mcp-item-{name}",
                     )
                 )
+
+    def _mcp_configs_for(self, domain_id: str) -> list[Any]:
+        """MCP configs available to *domain_id* (untagged servers are global)."""
+        return [
+            config
+            for _name, config, domains in self.mcp_configs
+            if domains is None or domain_id in domains
+        ]
+
+    def _refresh_skills_list(self, domain_id: str | None = None) -> None:
+        """List stored skills for the active domain in the sidebar Skills pane."""
+        domain_id = domain_id or self._active_domain_id()
+        list_view = self.query_one("#skills-list", ListView)
+        list_view.clear()
+        domain = get_domain(domain_id)
+        if not domain.skills_enabled:
+            list_view.append(
+                ListItem(
+                    Label("[dim]Skills not used by this expert type.[/dim]"),
+                    disabled=True,
+                )
+            )
+            return
+        skills = swe_skills.list_skills(domain_id)
+        if not skills:
+            list_view.append(
+                ListItem(
+                    Label("[dim]No skills stored yet.[/dim]"),
+                    disabled=True,
+                )
+            )
+            return
+        for skill in skills:
+            name = skill["name"]
+            description = skill.get("description", "")
+            label = f"🧠 [bold]{name}[/bold]"
+            if description:
+                label += f"\n[dim]{description[:60]}[/dim]"
+            list_view.append(ListItem(Label(label), id=f"skill-item-{name}"))
 
     @staticmethod
     def _build_http_mcp(
@@ -775,27 +846,32 @@ class SqwakvoxApp(App[None]):
             )
             return
 
+        # The user picks the expert type per document (no auto-detection).
+        domain_id = self._selected_domain()
+        self._doc_domains[source] = domain_id
+
         self.is_parsing = True
         self.active_error = None
 
+        domain = get_domain(domain_id)
         self.write_chat_message(
-            f"\n[italic dim]Starting layout ingestion for: {source}...[/italic dim]",
+            f"\n[italic dim]Starting {domain.display_name} ingestion for: {source}...[/italic dim]",
             persist=False,
         )
         self.write_chat_message(
             "[italic dim]Initializing Docling Parser (this may take a few seconds)...[/italic dim]",
             persist=False,
         )
-        logger.info("Initiated parsing for document source: %s", source)
+        logger.info("Initiated parsing for document source: %s (domain=%s)", source, domain_id)
 
         # Textual workers are asyncio Tasks on the same event loop as the
         # presenter, so we can await presenter calls directly.
         self._active_parse_handles[source] = self.run_worker(
-            self._dispatch_parse(source),
+            self._dispatch_parse(source, domain_id),
             name=f"docling_parser_{source}",
         )
 
-    async def _dispatch_parse(self, source: str) -> None:
+    async def _dispatch_parse(self, source: str, domain_id: str = "financial") -> None:
         """Async Textual worker that delegates document parsing to the
         Presenter (which talks to Celery in a background thread).
 
@@ -805,6 +881,11 @@ class SqwakvoxApp(App[None]):
         cross-validation — each tab is served in isolation, and a slow parse
         on one document never blocks agent queries on another.
         """
+        # The user picks the expert type per document; record it even when the
+        # dispatch is invoked directly (tests/tooling) rather than via the
+        # sidebar flow in _handle_parse.
+        self._doc_domains[source] = domain_id
+
         # Make sure the shared Docling worker is running before the parse
         # task is submitted (idempotent — only one process ever consumes the
         # docling queue).  Also ensure this document's dedicated agent worker
@@ -834,7 +915,7 @@ class SqwakvoxApp(App[None]):
                 if payload is None:
                     self._on_parse_failure("Parse was cancelled.")
                 else:
-                    self._on_parse_success(payload, source)
+                    self._on_parse_success(payload, source, domain_id)
             elif status == TaskStatus.FAILURE:
                 self._on_parse_failure(payload if isinstance(payload, str) else str(payload))
             elif status in (TaskStatus.REVOKED, TaskStatus.CANCELLED):
@@ -844,6 +925,7 @@ class SqwakvoxApp(App[None]):
         try:
             await self.presenter.parse_document(
                 source=source,
+                domain_id=domain_id,
                 queue=docling_queue,
                 on_progress=on_progress,
                 on_complete=on_complete,
@@ -859,10 +941,16 @@ class SqwakvoxApp(App[None]):
         if not self._active_parse_handles:
             self.is_parsing = False
 
-    def _on_parse_success(self, structured: StructuredDocument, source: str) -> None:
+    def _on_parse_success(
+        self, structured: StructuredDocument, source: str, domain_id: str = "financial"
+    ) -> None:
         # Note: is_parsing is cleared by _finish_parse once *all* in-flight
         # parses (possibly concurrent, one per document tab) have settled.
-        self.loaded_documents[source] = structured
+        self.loaded_documents[source] = LoadedDocument(
+            domain_id=domain_id,
+            structured=structured,
+            source=source,
+        )
         if structured.file_name not in self.chat_histories:
             saved = self._load_chat_log(structured.file_name)
             self.chat_histories[structured.file_name] = saved
@@ -949,39 +1037,54 @@ class SqwakvoxApp(App[None]):
     async def _dispatch_agent(self, model_id: str, api_key: str, user_query: str) -> None:
         """Async Textual worker that delegates agent execution to the Presenter.
 
-        The flow: first build the financial data store from the parsed doc
-        (also a Celery task), then submit the agent task.  Both are polled
-        by the presenter and callbacks update the UI directly on this loop.
+        The flow: first run the active domain's post-parse step (e.g. the
+        financial data store, or the SWE code/TOC index — both Celery tasks),
+        then submit the agent task.  Both are polled by the presenter and
+        callbacks update the UI directly on this loop.
         """
 
-        # --- Step 1: build the financial data store (Celery task) ---
+        # --- Step 1: domain post-parse (Celery task) ---
         doc = self.structured_doc
         if doc is None:
             self._on_agent_failure("No document loaded.")
             return
 
+        domain_id = self._active_domain_id()
         try:
-            ds_handle = await self.presenter.build_data_store(
+            ds_handle = await self.presenter.postprocess_document(
+                domain_id=domain_id,
                 document=doc,
                 queue=self._active_queue(),
                 on_error=self._on_agent_failure,
             )
-            # Wait until the data-store task finishes (callbacks fire on this loop).
+            # Wait until the post-parse task finishes (callbacks fire on this loop).
             await ds_handle.wait()
         except Exception as exc:
             self._on_agent_failure(str(exc))
             return
 
         if ds_handle.status == TaskStatus.SUCCESS:
-            data_store: dict[str, str] = ds_handle.result or {}
+            payload: dict[str, Any] = ds_handle.result or {}
         else:
             # The failure was already surfaced to the user via on_error.
             return
 
-        # --- Step 2: serialise MCP server configs for the broker ---
+        data_store: dict[str, str] = dict(payload.get("data_store", {}))
+        # Merge domain extras (SWE: toc, code_blocks, injection flags) into the
+        # stored document so the renderer/status can surface them.
+        extras = {k: v for k, v in payload.items() if k != "data_store"}
+        if extras and self.active_document_name:
+            source = self._active_source()
+            loaded = self.loaded_documents.get(source or "")
+            if loaded is not None:
+                loaded.structured.metadata.update(extras)
+
+        # --- Step 2: serialise the active domain's MCP server configs ---
         # any_agent MCP configs are Pydantic models; model_dump() yields a
         # broker-safe dict that the worker rehydrates into MCPParams.
-        mcp_servers: list[dict[str, Any]] = [cfg.model_dump() for _, cfg in self.mcp_configs]
+        mcp_servers: list[dict[str, Any]] = [
+            cfg.model_dump() for cfg in self._mcp_configs_for(domain_id)
+        ]
 
         # --- Step 3: submit the agent task ---
         def on_progress(status: TaskStatus, _payload: Any) -> None:
@@ -1009,6 +1112,7 @@ class SqwakvoxApp(App[None]):
                 data_store=data_store,
                 mcp_servers=mcp_servers,
                 thread_id=self.active_document_name or None,
+                domain_id=domain_id,
                 queue=self._active_queue(),
                 on_progress=on_progress,
                 on_complete=on_complete,
@@ -1043,8 +1147,8 @@ class SqwakvoxApp(App[None]):
 
         if result.math_discrepancies:
             disc_msg = (
-                "[bold yellow]System: Numerical discrepancies detected between "
-                "agent assertions and parsed tables![/bold yellow]"
+                "[bold yellow]System: Guardrail checks on the agent output "
+                "flagged the following:[/bold yellow]"
             )
             self.write_chat_message(disc_msg, persist=True)
             self.write_agent_response(disc_msg)
@@ -1120,19 +1224,24 @@ class SqwakvoxApp(App[None]):
         self.doc_context = doc.raw_markdown
         self.active_document_name = doc.file_name
 
-        # Find document source
+        # Find document source + its domain
         doc_source = ""
-        for src, d in self.loaded_documents.items():
-            if d == doc:
+        domain_id = "financial"
+        for src, loaded in self.loaded_documents.items():
+            if loaded.structured == doc:
                 doc_source = src
+                domain_id = loaded.domain_id
                 break
 
         if doc_source:
             self.query_one("#doc-source", Input).value = doc_source
 
-        # Update center rendering pane
+        # Update center rendering pane with the domain's renderer
         render_pane = self.query_one("#render-pane", DocumentRenderPane)
-        render_pane.update_document(doc)
+        render_pane.update_document(doc, domain_id)
+
+        # Refresh the skills list for the active domain
+        self._refresh_skills_list(domain_id)
 
         # Sync selection across UI elements
         if doc_source:
@@ -1207,15 +1316,15 @@ class SqwakvoxApp(App[None]):
 
         if 0 <= idx < len(self.ingestion_history):
             source = self.ingestion_history[idx]
-            doc = self.loaded_documents.get(source)
-            if doc and doc.file_name != self.active_document_name:
-                self._switch_to_document(doc, source="tab")
+            loaded = self.loaded_documents.get(source)
+            if loaded and loaded.file_name != self.active_document_name:
+                self._switch_to_document(loaded.structured, source="tab")
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id == "ingest-history" and event.index is not None:
             idx = event.index
             if 0 <= idx < len(self.ingestion_history):
                 source = self.ingestion_history[idx]
-                doc = self.loaded_documents.get(source)
-                if doc and doc.file_name != self.active_document_name:
-                    self._switch_to_document(doc, source="list")
+                loaded = self.loaded_documents.get(source)
+                if loaded and loaded.file_name != self.active_document_name:
+                    self._switch_to_document(loaded.structured, source="list")

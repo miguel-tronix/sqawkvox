@@ -15,7 +15,6 @@ from typing import Any, cast
 from any_agent import AgentConfig, AgentFramework, AnyAgent
 from any_agent import AnyAgent as AnyAgentLib
 from any_agent.config import MCPParams
-from jinja2 import Template
 
 from sqwakvox.models import ModelProvider
 from sqwakvox.telemetry import trace_span
@@ -200,22 +199,21 @@ def _patch_gemini_provider() -> None:
 
 
 _patch_gemini_provider()
-STANDARD_SYSTEM_INSTRUCTIONS_TEMPLATE = Template(
-    "You are a helpful Financial Document Assistant.\n"
-    "Always ground your answers in the document context provided below.\n\n"
-    "--- DOCUMENT CONTEXT ---\n"
-    "{{ context }}\n"
-    "------------------------"
-)
 
-UNIFIED_USER_PROMPT_TEMPLATE = Template(
-    "You are a helpful Financial Document Assistant.\n"
-    "Always ground your answers in the document context provided below.\n\n"
-    "--- DOCUMENT CONTEXT ---\n"
-    "{{ context }}\n"
-    "------------------------\n\n"
-    "{{ prompt }}"
-)
+
+def _default_templates() -> tuple[Any, Any]:
+    """Financial-domain templates as the fallback for missing domain prompts."""
+    from sqwakvox.domains import get_domain
+    from sqwakvox.domains.financial import (
+        STANDARD_SYSTEM_INSTRUCTIONS_TEMPLATE,
+        UNIFIED_USER_PROMPT_TEMPLATE,
+    )
+
+    financial = get_domain("financial")
+    return (
+        financial.system_instructions or STANDARD_SYSTEM_INSTRUCTIONS_TEMPLATE,
+        financial.user_prompt_template or UNIFIED_USER_PROMPT_TEMPLATE,
+    )
 
 
 _redis_checkpointer: Any | None = None
@@ -279,19 +277,31 @@ class AnyAgentOrchestrator:
         model_id: str,
         context: str,
         prompt: str,
+        domain: Any = None,
     ) -> tuple[str | None, str]:
-        """Inject and render the correct Jinja2 template depending on which model is selected.
+        """Inject and render the domain's Jinja2 templates for the model.
 
-        For models that do not support/accept a separate system role in agent queries
-        (e.g., gemini-3.6-flash), system instructions and context are injected directly into
-        the user prompt template, and instructions is set to None.
-        For models supporting system roles, system instructions are rendered into instructions.
+        For models that do not support/accept a separate system role in agent
+        queries (e.g., gemini-3.6-flash), system instructions and context are
+        injected directly into the user prompt template, and instructions is
+        set to None.  For models supporting system roles, system instructions
+        are rendered into instructions.
+
+        ``domain`` is a :class:`~sqwakvox.domains.base.DocumentDomain`; when
+        None the financial domain is used (backward compatibility).
         """
+        from sqwakvox.domains import get_domain
+
+        domain = domain or get_domain("financial")
+        system_tpl, user_tpl = _default_templates()
+        system_tpl = domain.system_instructions or system_tpl
+        user_tpl = domain.user_prompt_template or user_tpl
+
         if not ModelProvider.supports_system_role(model_id):
             instructions = None
-            formatted_prompt = UNIFIED_USER_PROMPT_TEMPLATE.render(context=context, prompt=prompt)
+            formatted_prompt = user_tpl.render(context=context, prompt=prompt)
         else:
-            instructions = STANDARD_SYSTEM_INSTRUCTIONS_TEMPLATE.render(context=context)
+            instructions = system_tpl.render(context=context)
             formatted_prompt = prompt
 
         return instructions, formatted_prompt
@@ -306,11 +316,16 @@ class AnyAgentOrchestrator:
         env_var: str,
         mcp_servers: list[MCPParams] | None = None,
         thread_id: str | None = None,
+        domain_id: str = "financial",
     ) -> str:
+        from sqwakvox.domains import get_domain
+
+        domain = get_domain(domain_id)
         instructions, formatted_prompt = cls.render_prompt(
             model_id=model_id,
             context=context,
             prompt=prompt,
+            domain=domain,
         )
 
         # Attach the Redis checkpointer only when the caller supplies a thread

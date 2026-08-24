@@ -120,11 +120,11 @@ def test_app_controller_cross_validate() -> None:
         mock_verify.assert_called_once_with([100.0, 150.0], 250.0)
 
 
-@patch("sqwakvox.controller.AnyGuardrailValidator")
-@patch("sqwakvox.controller.PIIRedactor")
+@patch("sqwakvox.guardrails.AnyGuardrailValidator")
+@patch("sqwakvox.guardrails.PIIRedactor")
 @patch("sqwakvox.controller.AuditLogger")
 @patch("sqwakvox.agent.AnyAgentOrchestrator")
-@patch("sqwakvox.controller.FinancialRuleEngine")
+@patch("sqwakvox.guardrails.FinancialRuleEngine")
 def test_app_controller_execute_agent_success(
     mock_engine: MagicMock,
     mock_orchestrator: MagicMock,
@@ -161,11 +161,11 @@ def test_app_controller_execute_agent_success(
     mock_audit.log.assert_called()
 
 
-@patch("sqwakvox.controller.AnyGuardrailValidator")
-@patch("sqwakvox.controller.PIIRedactor")
+@patch("sqwakvox.guardrails.AnyGuardrailValidator")
+@patch("sqwakvox.guardrails.PIIRedactor")
 @patch("sqwakvox.controller.AuditLogger")
 @patch("sqwakvox.agent.AnyAgentOrchestrator")
-@patch("sqwakvox.controller.FinancialRuleEngine")
+@patch("sqwakvox.guardrails.FinancialRuleEngine")
 def test_app_controller_execute_agent_blocked(
     mock_engine: MagicMock,
     mock_orchestrator: MagicMock,
@@ -195,11 +195,11 @@ def test_app_controller_execute_agent_blocked(
     assert result.success is False
 
 
-@patch("sqwakvox.controller.AnyGuardrailValidator")
-@patch("sqwakvox.controller.PIIRedactor")
+@patch("sqwakvox.guardrails.AnyGuardrailValidator")
+@patch("sqwakvox.guardrails.PIIRedactor")
 @patch("sqwakvox.controller.AuditLogger")
 @patch("sqwakvox.agent.AnyAgentOrchestrator")
-@patch("sqwakvox.controller.FinancialRuleEngine")
+@patch("sqwakvox.guardrails.FinancialRuleEngine")
 def test_app_controller_execute_agent_with_mcp(
     mock_engine: MagicMock,
     mock_orchestrator: MagicMock,
@@ -237,6 +237,7 @@ def test_app_controller_execute_agent_with_mcp(
         env_var="OPENAI_API_KEY",
         mcp_servers=mcp_servers,
         thread_id=None,
+        domain_id="financial",
     )
 
 
