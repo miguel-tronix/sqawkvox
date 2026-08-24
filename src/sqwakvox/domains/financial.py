@@ -79,9 +79,7 @@ def _postprocess(doc: StructuredDocument, source: str = "") -> dict[str, object]
                 for cell in row[1:]:
                     fv = gr.parse_financial_value(cell, default_unit=col_unit)
                     if fv is not None and label and len(label) > 1:
-                        data_store[label] = str(
-                            fv.raw_str if hasattr(fv, "raw_str") else fv
-                        )
+                        data_store[label] = str(fv.raw_str if hasattr(fv, "raw_str") else fv)
     return {"data_store": data_store}
 
 
