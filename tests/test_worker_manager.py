@@ -1,11 +1,17 @@
-"""Tests for the managed per-document worker subprocesses."""
+"""Tests for the managed Celery worker subprocesses."""
 
 import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from sqwakvox.worker_manager import DISABLE_ENV, WorkerManager, managed_workers_enabled
+from sqwakvox.worker_manager import (
+    DISABLE_ENV,
+    DOCLING_QUEUE,
+    DOCLING_WORKER_CONCURRENCY,
+    WorkerManager,
+    managed_workers_enabled,
+)
 
 _REAL_POPEN = subprocess.Popen
 
@@ -88,6 +94,35 @@ def test_spawn_failure_returns_false(mock_popen: MagicMock, manager: WorkerManag
 
     assert manager.ensure_worker("sqwakvox.doc0") is False
     assert manager.queues == []
+
+
+@patch("sqwakvox.worker_manager.subprocess.Popen")
+def test_ensure_docling_worker_spawns_shared_queue(
+    mock_popen: MagicMock, manager: WorkerManager
+) -> None:
+    """The Docling ingest worker is a single process on the shared queue."""
+    mock_popen.return_value = _fake_proc()
+
+    spawned = manager.ensure_docling_worker()
+
+    assert spawned is True
+    argv = mock_popen.call_args.args[0]
+    assert "sqwakvox.run_worker" in " ".join(argv)
+    assert argv[argv.index("--queue") + 1] == DOCLING_QUEUE
+    assert argv[argv.index("--concurrency") + 1] == str(DOCLING_WORKER_CONCURRENCY)
+    assert "--no-beat" in argv
+    assert manager.queues == [DOCLING_QUEUE]
+
+
+@patch("sqwakvox.worker_manager.subprocess.Popen")
+def test_ensure_docling_worker_is_singleton(mock_popen: MagicMock, manager: WorkerManager) -> None:
+    """No matter how many document tabs open, only one Docling worker spawns."""
+    mock_popen.return_value = _fake_proc()
+
+    assert manager.ensure_docling_worker() is True
+    assert manager.ensure_docling_worker() is False
+    assert manager.ensure_docling_worker() is False
+    assert mock_popen.call_count == 1
 
 
 @patch("sqwakvox.worker_manager.subprocess.Popen")

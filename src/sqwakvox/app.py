@@ -36,7 +36,7 @@ from sqwakvox.models import ModelProvider, StructuredDocument
 from sqwakvox.presenter import Presenter, TaskStatus
 from sqwakvox.renderer import DocumentRenderPane
 from sqwakvox.telemetry import get_telemetry
-from sqwakvox.worker_manager import WorkerManager, managed_workers_enabled
+from sqwakvox.worker_manager import DOCLING_QUEUE, WorkerManager, managed_workers_enabled
 
 logger = logging.getLogger(__name__)
 chat_logger = logging.getLogger("sqwakvox.chat")
@@ -276,8 +276,10 @@ class SqwakvoxApp(App[None]):
         self.mcp_configs: list[tuple[str, Any]] = []
         # Per-document-tab Celery queues and their managed workers.  Each
         # loaded document gets its own queue (``sqwakvox.doc<N>``) served by
-        # a dedicated worker subprocess, so a slow parse on one tab never
-        # blocks chat on another.
+        # a dedicated worker subprocess, so a slow agent query on one tab
+        # never blocks chat on another.  Document *conversion* (Docling)
+        # is shared: every tab's parse task routes to the single
+        # ``sqwakvox.docling`` worker (see :mod:`sqwakvox.worker_manager`).
         self._doc_queues: dict[str, str] = {}
         self.worker_manager = WorkerManager()
 
@@ -293,6 +295,17 @@ class SqwakvoxApp(App[None]):
         if source not in self._doc_queues:
             self._doc_queues[source] = f"sqwakvox.doc{len(self._doc_queues)}"
         return self._doc_queues[source]
+
+    def _docling_queue(self) -> str | None:
+        """The shared Docling conversion queue, or None to use the default.
+
+        Mirrors :meth:`_queue_for_source`: when managed workers are disabled
+        the parse task falls through to the default ``sqwakvox`` queue so an
+        externally started worker still picks it up.
+        """
+        if not managed_workers_enabled():
+            return None
+        return DOCLING_QUEUE
 
     def _active_source(self) -> str | None:
         """Return the ingestion source of the currently active document."""
@@ -786,19 +799,26 @@ class SqwakvoxApp(App[None]):
         """Async Textual worker that delegates document parsing to the
         Presenter (which talks to Celery in a background thread).
 
-        The source is assigned its own Celery queue and a dedicated worker
-        subprocess is spawned for it on first load, so each document tab is
-        served in isolation.
+        Conversion runs on the *shared* Docling worker (``sqwakvox.docling``)
+        so its heavyweight OCR models load once, while the document still
+        gets its own agent queue (``sqwakvox.doc<N>``) for later chat and
+        cross-validation — each tab is served in isolation, and a slow parse
+        on one document never blocks agent queries on another.
         """
-        # Assign this document its own queue and make sure a worker is
-        # running for it before the task is submitted.  The task may land in
-        # the queue a moment before the worker finishes booting; Celery holds
-        # it until the worker starts consuming.
-        queue = self._queue_for_source(source)
-        if queue is not None:
-            self.worker_manager.ensure_worker(queue)
+        # Make sure the shared Docling worker is running before the parse
+        # task is submitted (idempotent — only one process ever consumes the
+        # docling queue).  Also ensure this document's dedicated agent worker
+        # so it is ready for chat/cross-validation.  Tasks may land in a
+        # queue a moment before its worker finishes booting; Celery holds
+        # them until the worker starts consuming.
+        doc_queue = self._queue_for_source(source)
+        if doc_queue is not None:
+            self.worker_manager.ensure_worker(doc_queue)
+        docling_queue = self._docling_queue()
+        if docling_queue is not None:
+            self.worker_manager.ensure_docling_worker()
             self.write_chat_message(
-                f"[italic dim]Worker ready for tab queue: {queue}[/italic dim]",
+                f"[italic dim]Docling ingest worker ready (queue: {docling_queue})[/italic dim]",
                 persist=False,
             )
 
@@ -824,7 +844,7 @@ class SqwakvoxApp(App[None]):
         try:
             await self.presenter.parse_document(
                 source=source,
-                queue=queue,
+                queue=docling_queue,
                 on_progress=on_progress,
                 on_complete=on_complete,
             )

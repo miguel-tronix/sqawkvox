@@ -11,9 +11,10 @@ via ``celery_app.conf.include``) which in turn imports
 :class:`~sqwakvox.controller.AppController` for real document parsing,
 cross-validation, and agent execution.
 
-The TUI normally spawns and manages its own workers automatically (one per
-document tab — see :mod:`sqwakvox.worker_manager`).  Running this module by
-hand is still supported for debugging or for a single shared worker; set
+The TUI normally spawns and manages its own workers automatically (a single
+shared Docling ingest worker plus one agent worker per document tab — see
+:mod:`sqwakvox.worker_manager`).  Running this module by hand is still
+supported for debugging or for a single shared worker; set
 ``SQWAKVOX_MANAGED_WORKERS=0`` when launching the TUI to disable the managed
 workers and route everything to the queue consumed here::
 
@@ -57,7 +58,7 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Run the beat scheduler alongside the worker "
-        "(only one process may run beat; managed per-document workers pass --no-beat).",
+        "(only one process may run beat; managed workers pass --no-beat).",
     )
     args = parser.parse_args()
 

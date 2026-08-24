@@ -102,7 +102,8 @@ class Presenter:
         """Submit *task_name* and return a :class:`TaskHandle`.
 
         ``queue`` optionally routes the task to a specific Celery queue
-        (used for per-document-tab workers — see
+        (the shared ``sqwakvox.docling`` queue for document conversion, or a
+        per-document-tab queue for agent work — see
         :mod:`sqwakvox.worker_manager`); ``None`` uses the app default.
 
         ``on_progress`` fires with every poll (status + raw payload).

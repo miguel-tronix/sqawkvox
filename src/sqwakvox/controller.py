@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import logging
 import re
@@ -5,10 +7,9 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from billiard.exceptions import SoftTimeLimitExceeded  # type: ignore[import-untyped]
-from docling.document_converter import DocumentConverter
 
 from sqwakvox.guardrails import (
     AnyGuardrailValidator,
@@ -21,6 +22,9 @@ from sqwakvox.guardrails import (
 )
 from sqwakvox.models import ModelProvider, StructuredDocument, TableData
 from sqwakvox.telemetry import get_telemetry, trace_span
+
+if TYPE_CHECKING:
+    from docling.document_converter import DocumentConverter
 
 logger = logging.getLogger(__name__)
 
@@ -104,8 +108,32 @@ class AgentResult:
 
 
 class AppController:
-    def __init__(self, converter: DocumentConverter | None = None):
-        self.converter = converter or DocumentConverter()
+    def __init__(self, converter: DocumentConverter | None = None) -> None:
+        """Create a controller; the Docling converter is built lazily.
+
+        ``DocumentConverter`` is heavyweight (it loads OCR/layout models and
+        carries open file handles), so it is only constructed on the first
+        call to :meth:`convert_document`.  Workers that only run agent,
+        data-store, or cross-validation tasks therefore never pay the Docling
+        init cost — per-document agent workers never touch it at all.
+        """
+        self._converter = converter
+
+    @property
+    def converter(self) -> DocumentConverter:
+        """The Docling converter, constructed on first use."""
+        if self._converter is None:
+            # Imported lazily so processes that never parse a document (the
+            # per-tab agent workers) don't even load the docling package.
+            from docling.document_converter import DocumentConverter
+
+            self._converter = DocumentConverter()
+        return self._converter
+
+    @converter.setter
+    def converter(self, value: DocumentConverter) -> None:
+        """Allow injecting a converter (tests / custom pipelines)."""
+        self._converter = value
 
     def convert_document(
         self, source: str, is_cancelled: Callable[[], bool]
