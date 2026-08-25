@@ -9,7 +9,7 @@ author reusable skill files (see :mod:`sqwakvox.domains.swe.skills`).
 from __future__ import annotations
 
 from sqwakvox.domains.base import DocumentDomain
-from sqwakvox.domains.swe import ingest
+from sqwakvox.domains.swe import ingest, retrieval
 from sqwakvox.domains.swe import render as swe_render
 from sqwakvox.domains.swe.guardrails import swe_guardrails
 from sqwakvox.domains.swe.prompts import (
@@ -31,5 +31,8 @@ SWE_DOMAIN = DocumentDomain(
     postprocess=ingest.postprocess,
     guardrail_pipeline=swe_guardrails,
     render=swe_render.render,
+    #: Large documents get TOC + first chunks and search via the retrieval
+    #: MCP tool instead of the full raw markdown.
+    build_context=retrieval.build_retrieval_context,
     skills_enabled=True,
 )

@@ -18,6 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from jinja2 import Template
 
+from sqwakvox import guardrails as gr
 from sqwakvox.models import StructuredDocument
 
 if TYPE_CHECKING:
@@ -61,6 +62,22 @@ class OutputGuardrailResult:
     warnings: list[str] = field(default_factory=list)
 
 
+def standard_validate_input(prompt: str) -> InputGuardrailResult:
+    """Mozilla any-guardrail prompt check, then local PII redaction.
+
+    The shared input-guardrail stage used by domains that do not need
+    customised input validation (currently all of them).  Output validation
+    stays domain-specific (see each domain's ``_validate_output``).
+    """
+    if not gr.AnyGuardrailValidator.validate_prompt(prompt):
+        return InputGuardrailResult(
+            safe=False,
+            blocked_reason="Mozilla any-guardrail prompt safety violation",
+        )
+    redacted = gr.PIIRedactor.redact_text(prompt)
+    return InputGuardrailResult(safe=True, text=redacted)
+
+
 @dataclass
 class GuardrailPipeline:
     """The input/output guardrail hooks a domain runs around the agent call."""
@@ -72,6 +89,11 @@ class GuardrailPipeline:
 def _default_render(doc: StructuredDocument) -> str:
     """Fallback renderer: filename plus the raw markdown body."""
     return f"[bold]{doc.file_name}[/bold]\n\n{doc.raw_markdown or ''}"
+
+
+def default_build_context(doc: StructuredDocument) -> str:
+    """Default agent context: the document's full raw markdown."""
+    return doc.raw_markdown or ""
 
 
 @dataclass
@@ -99,15 +121,21 @@ class DocumentDomain:
     guardrail_pipeline: Callable[[], GuardrailPipeline] | None = None
     #: TUI renderer for parsed documents.
     render: Callable[[StructuredDocument], str] | None = None
+    #: Agent context builder; None uses :func:`default_build_context`
+    #: (full raw markdown).  The SWE domain overrides this with a
+    #: TOC + first-chunks context for large documents.
+    build_context: Callable[[StructuredDocument], str] | None = None
     #: Whether this domain can author/persist skill files (see
     #: :mod:`sqwakvox.domains.swe.skills`).
     skills_enabled: bool = False
     #: Skills storage root; ``None`` uses ``./skills/<domain_id>`` (cwd).
     skills_dir: str | None = None
 
-    def build_context(self, doc: StructuredDocument) -> str:
+    def context_for(self, doc: StructuredDocument) -> str:
         """The context string handed to the agent for this document."""
-        return doc.raw_markdown or ""
+        if self.build_context is not None:
+            return self.build_context(doc)
+        return default_build_context(doc)
 
 
 @dataclass

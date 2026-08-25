@@ -15,6 +15,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
     DirectoryTree,
     Footer,
     Header,
@@ -364,6 +365,10 @@ class SqwakvoxApp(App[None]):
                 options=[(d.display_name, d.domain_id) for d in list_domains()],
                 value="financial",
                 id="domain-selector",
+            )
+            yield Checkbox(
+                "Crawl docs site (SWE URLs)",
+                id="crawl-checkbox",
             )
             yield Button("Load & Parse", variant="primary", id="btn-parse")
 
@@ -850,6 +855,14 @@ class SqwakvoxApp(App[None]):
         domain_id = self._selected_domain()
         self._doc_domains[source] = domain_id
 
+        # Optional docs-site crawling for SWE URLs.
+        options: dict[str, Any] | None = None
+        try:
+            if self.query_one("#crawl-checkbox", Checkbox).value:
+                options = {"crawl": True}
+        except Exception:
+            options = None
+
         self.is_parsing = True
         self.active_error = None
 
@@ -867,11 +880,16 @@ class SqwakvoxApp(App[None]):
         # Textual workers are asyncio Tasks on the same event loop as the
         # presenter, so we can await presenter calls directly.
         self._active_parse_handles[source] = self.run_worker(
-            self._dispatch_parse(source, domain_id),
+            self._dispatch_parse(source, domain_id, options),
             name=f"docling_parser_{source}",
         )
 
-    async def _dispatch_parse(self, source: str, domain_id: str = "financial") -> None:
+    async def _dispatch_parse(
+        self,
+        source: str,
+        domain_id: str = "financial",
+        options: dict[str, Any] | None = None,
+    ) -> None:
         """Async Textual worker that delegates document parsing to the
         Presenter (which talks to Celery in a background thread).
 
@@ -880,6 +898,11 @@ class SqwakvoxApp(App[None]):
         gets its own agent queue (``sqwakvox.doc<N>``) for later chat and
         cross-validation — each tab is served in isolation, and a slow parse
         on one document never blocks agent queries on another.
+
+        After conversion, the domain's post-parse step runs on the document's
+        agent worker (data store / TOC+code index / retrieval indexing) and
+        its payload is merged into the document's metadata *before* the tab is
+        switched to, so rendering and agent context see the full picture.
         """
         # The user picks the expert type per document; record it even when the
         # dispatch is invoked directly (tests/tooling) rather than via the
@@ -903,6 +926,9 @@ class SqwakvoxApp(App[None]):
                 persist=False,
             )
 
+        parsed: StructuredDocument | None = None
+        parse_failed: str | None = None
+
         def on_progress(status: TaskStatus, _payload: Any) -> None:
             if status == TaskStatus.STARTED:
                 self.write_chat_message(
@@ -911,21 +937,19 @@ class SqwakvoxApp(App[None]):
                 )
 
         def on_complete(status: TaskStatus, payload: Any) -> None:
-            if status == TaskStatus.SUCCESS:
-                if payload is None:
-                    self._on_parse_failure("Parse was cancelled.")
-                else:
-                    self._on_parse_success(payload, source, domain_id)
+            nonlocal parsed, parse_failed
+            if status == TaskStatus.SUCCESS and isinstance(payload, StructuredDocument):
+                parsed = payload
             elif status == TaskStatus.FAILURE:
-                self._on_parse_failure(payload if isinstance(payload, str) else str(payload))
+                parse_failed = payload if isinstance(payload, str) else str(payload)
             elif status in (TaskStatus.REVOKED, TaskStatus.CANCELLED):
-                self._on_parse_failure("Parse was cancelled.")
-            self._finish_parse(source)
+                parse_failed = "Parse was cancelled."
 
         try:
             await self.presenter.parse_document(
                 source=source,
                 domain_id=domain_id,
+                options=options,
                 queue=docling_queue,
                 on_progress=on_progress,
                 on_complete=on_complete,
@@ -933,6 +957,62 @@ class SqwakvoxApp(App[None]):
         except Exception as exc:
             self._finish_parse(source)
             self._on_parse_failure(str(exc))
+            return
+
+        if parsed is None:
+            self._finish_parse(source)
+            self._on_parse_failure(parse_failed or "Parse failed.")
+            return
+
+        # --- Domain post-parse: cheap analysis on the doc's agent worker ---
+        payload: dict[str, Any] = {}
+        try:
+            pp_handle = await self.presenter.postprocess_document(
+                domain_id=domain_id,
+                document=parsed,
+                queue=doc_queue,
+            )
+            await pp_handle.wait()
+            if pp_handle.status == TaskStatus.SUCCESS:
+                payload = pp_handle.result or {}
+        except Exception:
+            logger.exception("Post-parse step failed for %s", source)
+
+        if payload:
+            parsed.metadata.update(payload)
+            self._surface_postprocess_info(domain_id, payload)
+
+        self._on_parse_success(parsed, source, domain_id)
+        self._finish_parse(source)
+
+    def _surface_postprocess_info(self, domain_id: str, payload: dict[str, Any]) -> None:
+        """Write parse-time analysis info (SWE: TOC/code/injection/retrieval)."""
+        if domain_id != "swe":
+            return
+        toc = payload.get("toc") or []
+        code_blocks = payload.get("code_blocks") or []
+        source_type = payload.get("source_type", "file")
+        pages = payload.get("pages_converted")
+        chunks = payload.get("chunk_count") or 0
+
+        details = [
+            f"[italic dim]Parsed as {source_type}: {len(toc)} section(s), "
+            f"{len(code_blocks)} code block(s), {chunks} search chunk(s).[/italic dim]"
+        ]
+        if pages:
+            details.append(f"[italic dim]{pages} docs-site pages converted.[/italic dim]")
+        for flag in payload.get("injection_flags") or []:
+            details.append(
+                f"[bold yellow]⚠ Potential prompt-injection text in document: "
+                f"{escape(flag)}[/bold yellow]"
+            )
+        if payload.get("needs_retrieval"):
+            details.append(
+                "[bold yellow]Large document: agent will search sections with the "
+                "retrieval tool instead of reading it whole.[/bold yellow]"
+            )
+        for line in details:
+            self.write_chat_message(line, persist=False)
 
     def _finish_parse(self, source: str) -> None:
         """Drop *source*'s parse handle; clear the parsing flag when done."""
@@ -1221,7 +1301,6 @@ class SqwakvoxApp(App[None]):
 
     def _switch_to_document(self, doc: StructuredDocument, source: str) -> None:
         self.structured_doc = doc
-        self.doc_context = doc.raw_markdown
         self.active_document_name = doc.file_name
 
         # Find document source + its domain
@@ -1232,6 +1311,10 @@ class SqwakvoxApp(App[None]):
                 doc_source = src
                 domain_id = loaded.domain_id
                 break
+
+        # The agent context is domain-built (large SWE docs get TOC + first
+        # chunks + search instructions instead of the full raw markdown).
+        self.doc_context = get_domain(domain_id).context_for(doc)
 
         if doc_source:
             self.query_one("#doc-source", Input).value = doc_source

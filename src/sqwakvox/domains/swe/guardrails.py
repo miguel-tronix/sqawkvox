@@ -12,7 +12,11 @@ import re
 from typing import Any
 
 from sqwakvox import guardrails as gr
-from sqwakvox.domains.base import GuardrailPipeline, InputGuardrailResult, OutputGuardrailResult
+from sqwakvox.domains.base import (
+    GuardrailPipeline,
+    OutputGuardrailResult,
+    standard_validate_input,
+)
 
 #: Patterns that look like API keys / tokens in agent output.
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
@@ -48,17 +52,6 @@ def scan_document_injections(text: str) -> list[str]:
     return [p for p in _INJECTION_PATTERNS if p in low]
 
 
-def _validate_input(prompt: str) -> InputGuardrailResult:
-    """Mozilla any-guardrail prompt check, then local PII redaction."""
-    if not gr.AnyGuardrailValidator.validate_prompt(prompt):
-        return InputGuardrailResult(
-            safe=False,
-            blocked_reason="Mozilla any-guardrail prompt safety violation",
-        )
-    redacted = gr.PIIRedactor.redact_text(prompt)
-    return InputGuardrailResult(safe=True, text=redacted)
-
-
 def _validate_output(text: str, data_store: dict[str, Any]) -> OutputGuardrailResult:
     """Output PII redaction plus secret redaction."""
     del data_store
@@ -71,4 +64,6 @@ def _validate_output(text: str, data_store: dict[str, Any]) -> OutputGuardrailRe
 
 
 def swe_guardrails() -> GuardrailPipeline:
-    return GuardrailPipeline(validate_input=_validate_input, validate_output=_validate_output)
+    return GuardrailPipeline(
+        validate_input=standard_validate_input, validate_output=_validate_output
+    )

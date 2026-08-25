@@ -79,7 +79,26 @@ def _stub_parse(
         return FakeHandle()
 
     monkeypatch.setattr(app.presenter, "parse_document", fake_parse)
+    _stub_postprocess(monkeypatch, app)
     return routed
+
+
+def _stub_postprocess(monkeypatch: pytest.MonkeyPatch, app: SqwakvoxApp) -> None:
+    """Replace presenter.postprocess_document with an instant, empty success."""
+
+    class PPHandle:
+        status = TaskStatus.SUCCESS
+
+        def __init__(self) -> None:
+            self.result: dict[str, object] = {}
+
+        async def wait(self, _timeout: float | None = None) -> TaskStatus:
+            return TaskStatus.SUCCESS
+
+    async def fake_postprocess(**_kwargs) -> PPHandle:
+        return PPHandle()
+
+    monkeypatch.setattr(app.presenter, "postprocess_document", fake_postprocess)
 
 
 @pytest.mark.asyncio
@@ -204,6 +223,7 @@ def _stub_parse_with_domain(
         return FakeHandle()
 
     monkeypatch.setattr(app.presenter, "parse_document", fake_parse)
+    _stub_postprocess(monkeypatch, app)
     return routed
 
 
@@ -251,3 +271,51 @@ async def test_active_domain_defaults_to_financial() -> None:
     app = SqwakvoxApp()
     async with app.run_test():
         assert app._active_domain_id() == "financial"
+
+
+@pytest.mark.asyncio
+async def test_parse_flow_merges_postprocess_payload_before_switch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """After conversion, the domain post-parse payload (TOC, flags, ...) must
+    be merged into the document's metadata before the tab switches, so the
+    renderer/agent context see the full picture."""
+    app = SqwakvoxApp()
+    async with app.run_test():
+        monkeypatch.setattr(app.worker_manager, "ensure_worker", lambda _queue, **_k: True)
+        monkeypatch.setattr(app.worker_manager, "ensure_docling_worker", lambda: True)
+
+        _stub_parse(monkeypatch, app, _doc1())
+
+        # Post-parse returns a SWE-style payload with an injection flag.
+        payload = {
+            "toc": [{"level": 1, "title": "Intro"}],
+            "code_blocks": [],
+            "injection_flags": ["ignore previous instructions"],
+            "source_type": "epub",
+            "needs_retrieval": True,
+            "chunk_count": 12,
+        }
+
+        class PPHandle:
+            status = TaskStatus.SUCCESS
+
+            def __init__(self) -> None:
+                self.result: dict[str, object] = payload
+
+            async def wait(self, _timeout: float | None = None) -> TaskStatus:
+                return TaskStatus.SUCCESS
+
+        async def fake_postprocess(**_kwargs) -> PPHandle:
+            return PPHandle()
+
+        monkeypatch.setattr(app.presenter, "postprocess_document", fake_postprocess)
+
+        await app._dispatch_parse("/tmp/book.epub", "swe")
+
+        # Payload merged into the stored document's metadata.
+        loaded = app.loaded_documents["/tmp/book.epub"]
+        assert loaded.structured.metadata["needs_retrieval"] is True
+        assert loaded.structured.metadata["injection_flags"] == ["ignore previous instructions"]
+        # Tab switched.
+        assert app.active_document_name == "doc1.pdf"

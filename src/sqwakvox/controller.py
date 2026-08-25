@@ -13,6 +13,7 @@ from billiard.exceptions import SoftTimeLimitExceeded  # type: ignore[import-unt
 
 from sqwakvox.domains import get_domain
 from sqwakvox.domains.base import GuardrailPipeline, InputGuardrailResult, OutputGuardrailResult
+from sqwakvox.domains.financial import extract_data_store
 from sqwakvox.guardrails import (
     AuditLogger,
     FinancialRuleEngine,
@@ -289,22 +290,16 @@ class AppController:
     def build_financial_data_store(
         self, structured_doc: StructuredDocument | None
     ) -> dict[str, FinancialValue]:
-        data_store: dict[str, FinancialValue] = {}
-        if not structured_doc:
-            return data_store
-        for table in structured_doc.tables:
-            col_unit = "number"
-            if table.headers and len(table.headers) >= 2:
-                col_unit = detect_unit(table.headers[1])
+        """Financial data store of parsed table values.
 
-            for row in table.rows:
-                if len(row) >= 2:
-                    label = row[0].strip()
-                    for cell in row[1:]:
-                        fv = parse_financial_value(cell, default_unit=col_unit)
-                        if fv is not None and label and len(label) > 1:
-                            data_store[label] = fv
-        return data_store
+        Delegates to the financial domain's ``extract_data_store`` (the
+        single implementation of the table-extraction loop) instead of
+        keeping a private copy; the broker-safe string variant lives in the
+        domain's post-parse step (``financial._postprocess``).
+        """
+        if structured_doc is None:
+            return {}
+        return extract_data_store(structured_doc)
 
     def cross_validate(
         self, structured_doc: StructuredDocument | None
