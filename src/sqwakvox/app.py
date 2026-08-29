@@ -970,7 +970,7 @@ class SqwakvoxApp(App[None]):
             # prefetches the rest in the background (see ``_prefetch_batch``).
             page_range = None
             if Path(source).suffix.lower() == ".pdf" and Path(source).is_file():
-                page_range = [1, PDF_BATCH_SIZE]
+                page_range = (1, PDF_BATCH_SIZE)
 
             parse_handle = await self.presenter.parse_document(
                 source=source,
@@ -1066,9 +1066,7 @@ class SqwakvoxApp(App[None]):
         # as a PDF page slice (controller stamps ``page_range`` on the result).
         if structured.metadata.get("page_range") is not None:
             loaded = self.loaded_documents[source]
-            loaded.batch_size = int(
-                structured.metadata.get("pages_in_batch") or PDF_BATCH_SIZE
-            )
+            loaded.batch_size = int(structured.metadata.get("pages_in_batch") or PDF_BATCH_SIZE)
             loaded.total_pages = structured.metadata.get("total_pages")
             loaded.rendered_pages = loaded.batch_size
             loaded.next_batch = 1
@@ -1165,7 +1163,7 @@ class SqwakvoxApp(App[None]):
             handle = await self.presenter.parse_document(
                 source=source,
                 domain_id=domain_id,
-                page_range=[start, end],
+                page_range=(start, end),
                 queue=docling_queue,
                 on_complete=on_complete,
             )
@@ -1192,7 +1190,7 @@ class SqwakvoxApp(App[None]):
                     handle = await self.presenter.parse_document(
                         source=source,
                         domain_id=loaded.domain_id,
-                        page_range=[start, end],
+                        page_range=(start, end),
                         queue=self._docling_queue(),
                     )
                     await handle.wait()

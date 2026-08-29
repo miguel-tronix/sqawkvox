@@ -148,9 +148,7 @@ def delete_document(doc_id: str) -> None:
 def count_chunks(doc_id: str) -> int:
     con = _connect()
     try:
-        row = con.execute(
-            "SELECT COUNT(*) FROM doc_chunks WHERE doc_id = ?", (doc_id,)
-        ).fetchone()
+        row = con.execute("SELECT COUNT(*) FROM doc_chunks WHERE doc_id = ?", (doc_id,)).fetchone()
         return int(row[0]) if row else 0
     finally:
         con.close()

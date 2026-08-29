@@ -111,7 +111,10 @@ class DocumentDomain:
     pre_convert: Callable[[str, dict[str, Any]], IngestPlan] | None = None
     #: Convert a planned source into a StructuredDocument (runs in the worker).
     convert: (
-        Callable[[Controller, str, IngestPlan, Callable[[], bool]], StructuredDocument | None]
+        Callable[
+            [Controller, str, IngestPlan, Callable[[], bool], tuple[int, int] | None],
+            StructuredDocument | None,
+        ]
         | None
     ) = None
     #: Post-parse processing (runs on the per-document agent worker).

@@ -96,7 +96,7 @@ def convert_document(
             source, is_cancelled, domain_id=domain_id, page_range=page_range
         )
         if convert_fn is None
-        else convert_fn(controller, source, plan, is_cancelled, page_range=page_range)
+        else convert_fn(controller, source, plan, is_cancelled, page_range)
     )
     if doc is None:
         return None

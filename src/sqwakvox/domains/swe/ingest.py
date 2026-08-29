@@ -60,9 +60,7 @@ def build_ingest_plan(source: str, options: dict[str, Any] | None = None) -> Ing
         if options.get("crawl") is True:
             from sqwakvox.domains.swe.crawl import DEFAULT_MAX_PAGES, crawl_site
 
-            pages = crawl_site(
-                source, max_pages=int(options.get("max_pages", DEFAULT_MAX_PAGES))
-            )
+            pages = crawl_site(source, max_pages=int(options.get("max_pages", DEFAULT_MAX_PAGES)))
             if len(pages) > 1:
                 return IngestPlan(
                     kind="site",
@@ -104,9 +102,7 @@ def convert(
         return _convert_epub(controller, source, is_cancelled)
     if plan.kind == "site":
         return _convert_site(controller, source, plan, is_cancelled)
-    doc = controller.convert_document(
-        source, is_cancelled, domain_id="swe", page_range=page_range
-    )
+    doc = controller.convert_document(source, is_cancelled, domain_id="swe", page_range=page_range)
     doc = doc if isinstance(doc, StructuredDocument) else None
     if doc is not None:
         doc.metadata.update(plan.metadata)
@@ -163,9 +159,7 @@ def _page_title(page_doc: StructuredDocument) -> str:
     return page_doc.file_name or "Page"
 
 
-def _convert_epub(
-    controller: Any, source: str, is_cancelled: Any
-) -> StructuredDocument | None:
+def _convert_epub(controller: Any, source: str, is_cancelled: Any) -> StructuredDocument | None:
     """Parse an EPUB and convert each chapter (XHTML) with Docling.
 
     Chapters are fed through ``controller.convert_html_string`` so the shared

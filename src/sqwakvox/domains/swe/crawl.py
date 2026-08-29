@@ -116,9 +116,7 @@ def crawl_site(
             sitemap_pages = [u for u in _parse_sitemap(xml) if _same_host(u, host)]
             sitemap_pages = list(dict.fromkeys(sitemap_pages))[:max_pages]
             if sitemap_pages:
-                logger.info(
-                    "Crawling %d pages from sitemap %s", len(sitemap_pages), sitemap_url
-                )
+                logger.info("Crawling %d pages from sitemap %s", len(sitemap_pages), sitemap_url)
                 return sitemap_pages
 
     # --- BFS fallback ---

@@ -4,6 +4,8 @@ import json
 import logging
 import re
 import time
+import pypdfium2 as pdfium # type: ignore[import-untyped]
+
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,8 +86,6 @@ def pdf_page_count(source: str) -> int | None:
     if not Path(source).is_file():
         return None
     try:
-        import pypdfium2 as pdfium
-
         with pdfium.PdfDocument(source) as pdf:
             return len(pdf)
     except Exception as exc:  # counting must never break parsing

@@ -90,8 +90,7 @@ def list_indexed_documents() -> str:
 
     def _run() -> str:
         docs = [
-            {"document_id": doc_id, "chunks": count}
-            for doc_id, count in retrieval.list_documents()
+            {"document_id": doc_id, "chunks": count} for doc_id, count in retrieval.list_documents()
         ]
         return json.dumps(docs, indent=2)
 

@@ -18,7 +18,6 @@ from collections.abc import Callable
 from typing import Any
 
 import numpy as np
-
 from fastmcp import FastMCP
 
 from sqwakvox.telemetry import get_telemetry, trace_span
@@ -457,7 +456,7 @@ def _parse_number_list(raw: str) -> list[float]:
     return result
 
 
-def _parse_matrix(raw: str) -> "np.ndarray":
+def _parse_matrix(raw: str) -> np.ndarray:
     """Parse a newline-separated matrix (comma/space columns) into a 2D array."""
     rows: list[list[float]] = []
     for line in raw.strip().splitlines():
