@@ -4,13 +4,12 @@ import json
 import logging
 import re
 import time
-import pypdfium2 as pdfium # type: ignore[import-untyped]
-
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+import pypdfium2 as pdfium  # type: ignore[import-untyped]
 from billiard.exceptions import SoftTimeLimitExceeded  # type: ignore[import-untyped]
 
 from sqwakvox.domains import get_domain
