@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "sqwakvox"
-version = "1.4.0"
+version = "1.4.1"
 description = "Local AI Financial Document Assistant with Textual TUI, Docling Ingestion, and Mozilla any-guardrail Validation"
 readme = "README.md"
 requires-python = ">=3.12"
@@ -38,7 +38,10 @@ dependencies = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp>=1.20.0",
     "fastmcp>=3.4.5",
+    "numpy>=1.26.0",
     "ebooklib>=0.20",
+    # Cheap PDF page count (no OCR) so large PDFs load incrementally by slice.
+    "pypdfium2>=4.0.0",
 ]
 
 [dependency-groups]

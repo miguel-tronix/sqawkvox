@@ -210,6 +210,8 @@ class Presenter:
         source: str,
         *,
         domain_id: str = "financial",
+        options: dict[str, Any] | None = None,
+        page_range: tuple[int, int] | None = None,
         queue: str | None = None,
         on_progress: Callable[[TaskStatus, Any], None] | None = None,
         on_complete: Callable[[TaskStatus, StructuredDocument | None], None] | None = None,
@@ -217,6 +219,11 @@ class Presenter:
     ) -> TaskHandle:
         """Submit a document parse and deserialise the result into a
         :class:`StructuredDocument`.
+
+        ``options`` is passed to the domain's ingest plan (e.g. ``crawl`` /
+        ``max_pages`` for SWE docs sites).  ``page_range`` restricts a PDF
+        conversion to a 1-based ``[start, end]`` slice so big documents load
+        incrementally.
         """
 
         def _on_complete(status: TaskStatus, payload: Any) -> None:
@@ -229,10 +236,15 @@ class Presenter:
                 else:
                     on_complete(status, payload)
 
+        kwargs: dict[str, Any] = {"domain_id": domain_id}
+        if options:
+            kwargs["options"] = options
+        if page_range is not None:
+            kwargs["page_range"] = list(page_range)
         return await self.submit_task(
             "convert_document",
             args=[source],
-            kwargs={"domain_id": domain_id},
+            kwargs=kwargs,
             queue=queue,
             on_progress=on_progress,
             on_complete=_on_complete,

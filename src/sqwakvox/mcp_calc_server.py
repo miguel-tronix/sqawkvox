@@ -17,6 +17,7 @@ from collections import Counter
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
 from fastmcp import FastMCP
 
 from sqwakvox.telemetry import get_telemetry, trace_span
@@ -193,31 +194,30 @@ def stats_summary(numbers: str) -> str:
         if n == 0:
             return "Error: no numbers provided"
 
-        total = sum(values)
-        mean = total / n
-        sorted_vals = sorted(values)
+        arr = np.asarray(values, dtype=float)
 
-        if n % 2 == 1:
-            median = sorted_vals[n // 2]
-        else:
-            median = (sorted_vals[n // 2 - 1] + sorted_vals[n // 2]) / 2
+        total = float(np.sum(arr))
+        mean = float(np.mean(arr))
+        median = float(np.median(arr))
 
         counts = Counter(values)
         max_count = max(counts.values())
         modes = sorted(k for k, v in counts.items() if v == max_count)
         mode_str = ", ".join(f"{m:.10g}" for m in modes) if len(modes) < len(values) else "none"
 
-        variance = sum((x - mean) ** 2 for x in values) / n
-        std_dev = math.sqrt(variance)
+        variance = float(np.var(arr))
+        std_dev = float(np.std(arr))
+        vmin = float(np.min(arr))
+        vmax = float(np.max(arr))
 
         return (
             f"Count: {n}\n"
             f"Sum: {total:.10g}\n"
             f"Mean: {mean:.10g}\n"
             f"Median: {median:.10g}\n"
-            f"Min: {sorted_vals[0]:.10g}\n"
-            f"Max: {sorted_vals[-1]:.10g}\n"
-            f"Range: {sorted_vals[-1] - sorted_vals[0]:.10g}\n"
+            f"Min: {vmin:.10g}\n"
+            f"Max: {vmax:.10g}\n"
+            f"Range: {vmax - vmin:.10g}\n"
             f"Variance (population): {variance:.10g}\n"
             f"Std Dev (population): {std_dev:.10g}\n"
             f"Mode(s): {mode_str}"
@@ -238,7 +238,7 @@ def stats_mean(numbers: str) -> str:
             return f"Error: {exc}"
         if not values:
             return "Error: no numbers provided"
-        return f"{sum(values) / len(values):.10g}"
+        return f"{np.mean(np.asarray(values, dtype=float)):.10g}"
 
     return _trace_tool("stats_mean", _run)
 
@@ -255,11 +255,7 @@ def stats_median(numbers: str) -> str:
             return f"Error: {exc}"
         if not values:
             return "Error: no numbers provided"
-        n = len(values)
-        sv = sorted(values)
-        if n % 2 == 1:
-            return f"{sv[n // 2]:.10g}"
-        return f"{(sv[n // 2 - 1] + sv[n // 2]) / 2:.10g}"
+        return f"{np.median(np.asarray(values, dtype=float)):.10g}"
 
     return _trace_tool("stats_median", _run)
 
@@ -276,9 +272,7 @@ def stats_stddev(numbers: str) -> str:
             return f"Error: {exc}"
         if not values:
             return "Error: no numbers provided"
-        mean = sum(values) / len(values)
-        var = sum((x - mean) ** 2 for x in values) / len(values)
-        return f"{math.sqrt(var):.10g}"
+        return f"{np.std(np.asarray(values, dtype=float)):.10g}"
 
     return _trace_tool("stats_stddev", _run)
 
@@ -295,8 +289,7 @@ def stats_variance(numbers: str) -> str:
             return f"Error: {exc}"
         if not values:
             return "Error: no numbers provided"
-        mean = sum(values) / len(values)
-        return f"{sum((x - mean) ** 2 for x in values) / len(values):.10g}"
+        return f"{np.var(np.asarray(values, dtype=float)):.10g}"
 
     return _trace_tool("stats_variance", _run)
 
@@ -313,9 +306,58 @@ def stats_minmax(numbers: str) -> str:
             return f"Error: {exc}"
         if not values:
             return "Error: no numbers provided"
-        return f"Min: {min(values):.10g}, Max: {max(values):.10g}"
+        arr = np.asarray(values, dtype=float)
+        return f"Min: {np.min(arr):.10g}, Max: {np.max(arr):.10g}"
 
     return _trace_tool("stats_minmax", _run)
+
+
+@mcp.tool(
+    name="stats_2d",
+    description=(
+        "Compute statistics for a 2D numeric matrix given as rows separated by "
+        "newlines and columns by commas/spaces. Aggregates across axis=0 "
+        "(per-column, down each row) or axis=1 (per-row, across each column). "
+        "Returns mean, median, min, max, std, var for the chosen axis."
+    ),
+)
+def stats_2d(matrix: str, axis: int = 0) -> str:
+    """Compute per-column or per-row statistics for a 2D numeric matrix."""
+
+    def _run() -> str:
+        try:
+            arr = _parse_matrix(matrix)
+        except ValueError as exc:
+            return f"Error: {exc}"
+
+        if arr.size == 0:
+            return "Error: no numbers provided"
+
+        if axis not in (0, 1):
+            return "Error: axis must be 0 (per-column) or 1 (per-row)"
+
+        mean = np.mean(arr, axis=axis)
+        median = np.median(arr, axis=axis)
+        vmin = np.min(arr, axis=axis)
+        vmax = np.max(arr, axis=axis)
+        std = np.std(arr, axis=axis)
+        var = np.var(arr, axis=axis)
+
+        label = "Column" if axis == 0 else "Row"
+        lines = [f"{label}-wise statistics (axis={axis}):"]
+        for i in range(mean.shape[0]):
+            lines.append(
+                f"{label} {i}: "
+                f"mean={mean[i]:.10g}, "
+                f"median={median[i]:.10g}, "
+                f"min={vmin[i]:.10g}, "
+                f"max={vmax[i]:.10g}, "
+                f"std={std[i]:.10g}, "
+                f"var={var[i]:.10g}"
+            )
+        return "\n".join(lines)
+
+    return _trace_tool("stats_2d", _run)
 
 
 # ---------------------------------------------------------------------------
@@ -412,6 +454,26 @@ def _parse_number_list(raw: str) -> list[float]:
         except ValueError:
             raise ValueError(f"Not a valid number: '{p}'") from None
     return result
+
+
+def _parse_matrix(raw: str) -> np.ndarray:
+    """Parse a newline-separated matrix (comma/space columns) into a 2D array."""
+    rows: list[list[float]] = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(_parse_number_list(line))
+        except ValueError:
+            raise
+    if not rows:
+        return np.empty((0, 0), dtype=float)
+    width = len(rows[0])
+    for r in rows:
+        if len(r) != width:
+            raise ValueError("All matrix rows must have the same number of columns")
+    return np.asarray(rows, dtype=float)
 
 
 # ---------------------------------------------------------------------------

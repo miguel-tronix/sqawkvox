@@ -2,31 +2,67 @@
   "mcpServers": {
     "calc-stats": {
       "command": ".venv/bin/python",
-      "args": ["-m", "sqwakvox.mcp_calc_server"],
+      "args": [
+        "-m",
+        "sqwakvox.mcp_calc_server"
+      ],
       "client_session_timeout_seconds": 300,
-      "domains": ["financial"]
+      "domains": [
+        "financial"
+      ]
     },
     "fetch": {
       "command": "uvx",
-      "args": ["--with", "mcp<2.0", "mcp-server-fetch"],
+      "args": [
+        "--with",
+        "mcp<2.0",
+        "mcp-server-fetch"
+      ],
       "client_session_timeout_seconds": 300,
-      "domains": ["swe"]
+      "domains": [
+        "swe"
+      ]
     },
     "skills": {
       "command": ".venv/bin/python",
-      "args": ["-m", "sqwakvox.mcp_skills_server"],
+      "args": [
+        "-m",
+        "sqwakvox.mcp_skills_server"
+      ],
       "client_session_timeout_seconds": 300,
-      "domains": ["swe"]
+      "domains": [
+        "swe"
+      ]
     },
     "sqlite": {
       "command": "uvx",
-      "args": ["--with", "mcp<2.0", "mcp-server-sqlite", "--db-path", "sqwakvox_mcp.db"],
+      "args": [
+        "--with",
+        "mcp<2.0",
+        "mcp-server-sqlite",
+        "--db-path",
+        "sqwakvox_mcp.db"
+      ],
       "client_session_timeout_seconds": 300
     },
     "ascii-charts": {
       "command": "npx",
-      "args": ["-y", "mcp-ascii-charts"],
+      "args": [
+        "-y",
+        "mcp-ascii-charts"
+      ],
       "client_session_timeout_seconds": 300
+    },
+    "retrieval": {
+      "command": ".venv/bin/python",
+      "args": [
+        "-m",
+        "sqwakvox.mcp_retrieval_server"
+      ],
+      "client_session_timeout_seconds": 300,
+      "domains": [
+        "swe"
+      ]
     }
   }
 }
