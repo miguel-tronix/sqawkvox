@@ -6,7 +6,8 @@ __pycache__
 # uv settings
 #uv.lock
 .uv
-
+# Samples
+samples/*
 # App logs
 sqwakvox.log
 sqwakvoxchat.log

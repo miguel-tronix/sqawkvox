@@ -16,8 +16,8 @@ from sqwakvox import guardrails as gr
 from sqwakvox.domains.base import (
     DocumentDomain,
     GuardrailPipeline,
-    InputGuardrailResult,
     OutputGuardrailResult,
+    standard_validate_input,
 )
 from sqwakvox.models import StructuredDocument
 
@@ -39,17 +39,6 @@ UNIFIED_USER_PROMPT_TEMPLATE = Template(
 )
 
 
-def _validate_input(prompt: str) -> InputGuardrailResult:
-    """Mozilla any-guardrail prompt check, then local PII redaction."""
-    if not gr.AnyGuardrailValidator.validate_prompt(prompt):
-        return InputGuardrailResult(
-            safe=False,
-            blocked_reason="Mozilla any-guardrail prompt safety violation",
-        )
-    redacted = gr.PIIRedactor.redact_text(prompt)
-    return InputGuardrailResult(safe=True, text=redacted)
-
-
 def _validate_output(text: str, data_store: dict[str, object]) -> OutputGuardrailResult:
     """Output PII redaction plus financial math cross-checking."""
     redacted = gr.PIIRedactor.redact_text(text)
@@ -61,13 +50,19 @@ def _validate_output(text: str, data_store: dict[str, object]) -> OutputGuardrai
 
 
 def _guardrails() -> GuardrailPipeline:
-    return GuardrailPipeline(validate_input=_validate_input, validate_output=_validate_output)
+    return GuardrailPipeline(
+        validate_input=standard_validate_input, validate_output=_validate_output
+    )
 
 
-def _postprocess(doc: StructuredDocument, source: str = "") -> dict[str, object]:
-    """Build the financial data store from parsed tables (broker-safe strings)."""
-    del source  # hook contract: domain postprocess signature
-    data_store: dict[str, str] = {}
+def extract_data_store(doc: StructuredDocument) -> dict[str, gr.FinancialValue]:
+    """Parse document tables into a ``{label: FinancialValue}`` store.
+
+    Single source of truth for the financial data-store extraction: both the
+    broker-safe string store (:func:`_postprocess`) and the parsed-value
+    store (``AppController.build_financial_data_store``) derive from this.
+    """
+    data_store: dict[str, gr.FinancialValue] = {}
     for table in doc.tables:
         col_unit = "number"
         if table.headers and len(table.headers) >= 2:
@@ -79,7 +74,16 @@ def _postprocess(doc: StructuredDocument, source: str = "") -> dict[str, object]
                 for cell in row[1:]:
                     fv = gr.parse_financial_value(cell, default_unit=col_unit)
                     if fv is not None and label and len(label) > 1:
-                        data_store[label] = str(fv.raw_str if hasattr(fv, "raw_str") else fv)
+                        data_store[label] = fv
+    return data_store
+
+
+def _postprocess(doc: StructuredDocument, source: str = "") -> dict[str, object]:
+    """Build the financial data store from parsed tables (broker-safe strings)."""
+    del source  # hook contract: domain postprocess signature
+    data_store: dict[str, str] = {}
+    for label, fv in extract_data_store(doc).items():
+        data_store[label] = str(fv.raw_str if hasattr(fv, "raw_str") else fv)
     return {"data_store": data_store}
 
 

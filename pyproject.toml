@@ -38,7 +38,10 @@ dependencies = [
     "opentelemetry-sdk>=1.20.0",
     "opentelemetry-exporter-otlp>=1.20.0",
     "fastmcp>=3.4.5",
+    "numpy>=1.26.0",
     "ebooklib>=0.20",
+    # Cheap PDF page count (no OCR) so large PDFs load incrementally by slice.
+    "pypdfium2>=4.0.0",
 ]
 
 [dependency-groups]

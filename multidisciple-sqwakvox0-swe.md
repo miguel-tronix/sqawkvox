@@ -1,7 +1,7 @@
 # Multidisciple Sqwakvox — SWE Document Assistant Architecture
 
-Status: **Proposal / Implementation plan** · Author: sqwakvox0 · Scope: architecture for the first
-non-financial document assistant (Software Engineering), designed so further domains slot in cheaply.
+Status: **Phase 1 ✅ implemented · Phase 2 ✅ implemented** · Author: sqwakvox0 · Scope: architecture
+for the first non-financial document assistant (Software Engineering), designed so further domains slot in cheaply.
 
 ---
 
@@ -455,11 +455,15 @@ convention (the repo's own `.agents` skills are already consumed by other tools)
 - Tests: registry, ingest plans (epub extraction with fixture EPUB), skills server (tmp dir),
   routing (domain_id through presenter), renderer per-domain, guardrail pipeline composition.
 
-### Phase 2 — scale & site crawling
-- Docs-site crawler (`kind="site"`, sitemap-aware, depth/domain caps).
-- Chunked retrieval: chunker + SQLite FTS5 index + `mcp_retrieval_server.py` + `build_context`
-  override for `needs_retrieval` docs.
-- `SecretScanner` on outputs; injection-scan feedback surfaced in the TUI.
+### Phase 2 — scale & site crawling ✅
+- Docs-site crawler (`kind="site"`, sitemap-aware, same-host, depth/page caps) — opt-in via the
+  TUI's **"Crawl docs site"** checkbox or `options={"crawl": True}` (auto-detects docs-root URLs).
+- Chunked retrieval: heading-aware chunker + SQLite FTS5 (BM25) index at
+  `~/.sqwakvox/swe/index.db` + `mcp_retrieval_server.py` (`search_document` /
+  `index_info` / `list_indexed_documents`) + `build_context` override for `needs_retrieval` docs
+  (TOC + first chunks + search instructions).
+- `SecretScanner` on outputs (Phase 1); injection-scan feedback surfaced in the TUI after each
+  SWE parse, alongside section/code-block/chunk counts and the retrieval notice.
 
 ### Phase 3 — third domain & tuning
 - Pick a second new domain (e.g. legal/medical) to prove the registry: expected effort is

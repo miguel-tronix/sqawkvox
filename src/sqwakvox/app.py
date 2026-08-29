@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import json
 import logging
+import os
 import re
 from pathlib import Path
 from typing import Any, ClassVar
@@ -15,6 +16,7 @@ from textual.reactive import reactive
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
     DirectoryTree,
     Footer,
     Header,
@@ -43,6 +45,11 @@ from sqwakvox.worker_manager import DOCLING_QUEUE, WorkerManager, managed_worker
 
 logger = logging.getLogger(__name__)
 chat_logger = logging.getLogger("sqwakvox.chat")
+
+#: Pages fetched per slice when a PDF is loaded incrementally.  Override with
+#: ``SQWAKVOX_PDF_BATCH_SIZE`` (the first slice renders immediately; further
+#: slices are prefetched in the background and shown via "Load more").
+PDF_BATCH_SIZE = int(os.environ.get("SQWAKVOX_PDF_BATCH_SIZE", "10"))
 
 CSS = """
 Screen {
@@ -365,6 +372,10 @@ class SqwakvoxApp(App[None]):
                 value="financial",
                 id="domain-selector",
             )
+            yield Checkbox(
+                "Crawl docs site (SWE URLs)",
+                id="crawl-checkbox",
+            )
             yield Button("Load & Parse", variant="primary", id="btn-parse")
 
             yield Label("[bold]Model Configuration[/bold]", id="model-config-label")
@@ -400,7 +411,16 @@ class SqwakvoxApp(App[None]):
                 Tab("Agent Response", id="view-agent"),
                 id="view-tabs",
             )
-            yield DocumentRenderPane(id="render-pane")
+            with Vertical(id="doc-view-container"):
+                yield DocumentRenderPane(id="render-pane")
+                with Horizontal(id="doc-pager-row"):
+                    yield Button(
+                        "Load more pages ↓",
+                        id="btn-load-more",
+                        variant="default",
+                        disabled=True,
+                    )
+                    yield Label("", id="page-indicator")
             yield RichLog(id="agent-response-pane", highlight=True, markup=True, wrap=True)
 
         with Vertical(id="chat-column"):
@@ -823,6 +843,10 @@ class SqwakvoxApp(App[None]):
             self._handle_parse()
         elif event.button.id == "btn-send":
             self._handle_chat()
+        elif event.button.id == "btn-load-more":
+            source = self._active_source()
+            if source:
+                self.run_worker(self._load_more(source), name=f"load_more_{source}")
 
     def _on_file_selected(self, path: Path | None) -> None:
         if path:
@@ -850,6 +874,14 @@ class SqwakvoxApp(App[None]):
         domain_id = self._selected_domain()
         self._doc_domains[source] = domain_id
 
+        # Optional docs-site crawling for SWE URLs.
+        options: dict[str, Any] | None = None
+        try:
+            if self.query_one("#crawl-checkbox", Checkbox).value:
+                options = {"crawl": True}
+        except Exception:
+            options = None
+
         self.is_parsing = True
         self.active_error = None
 
@@ -867,11 +899,16 @@ class SqwakvoxApp(App[None]):
         # Textual workers are asyncio Tasks on the same event loop as the
         # presenter, so we can await presenter calls directly.
         self._active_parse_handles[source] = self.run_worker(
-            self._dispatch_parse(source, domain_id),
+            self._dispatch_parse(source, domain_id, options),
             name=f"docling_parser_{source}",
         )
 
-    async def _dispatch_parse(self, source: str, domain_id: str = "financial") -> None:
+    async def _dispatch_parse(
+        self,
+        source: str,
+        domain_id: str = "financial",
+        options: dict[str, Any] | None = None,
+    ) -> None:
         """Async Textual worker that delegates document parsing to the
         Presenter (which talks to Celery in a background thread).
 
@@ -880,6 +917,11 @@ class SqwakvoxApp(App[None]):
         gets its own agent queue (``sqwakvox.doc<N>``) for later chat and
         cross-validation — each tab is served in isolation, and a slow parse
         on one document never blocks agent queries on another.
+
+        After conversion, the domain's post-parse step runs on the document's
+        agent worker (data store / TOC+code index / retrieval indexing) and
+        its payload is merged into the document's metadata *before* the tab is
+        switched to, so rendering and agent context see the full picture.
         """
         # The user picks the expert type per document; record it even when the
         # dispatch is invoked directly (tests/tooling) rather than via the
@@ -903,6 +945,9 @@ class SqwakvoxApp(App[None]):
                 persist=False,
             )
 
+        parsed: StructuredDocument | None = None
+        parse_failed: str | None = None
+
         def on_progress(status: TaskStatus, _payload: Any) -> None:
             if status == TaskStatus.STARTED:
                 self.write_chat_message(
@@ -911,28 +956,94 @@ class SqwakvoxApp(App[None]):
                 )
 
         def on_complete(status: TaskStatus, payload: Any) -> None:
-            if status == TaskStatus.SUCCESS:
-                if payload is None:
-                    self._on_parse_failure("Parse was cancelled.")
-                else:
-                    self._on_parse_success(payload, source, domain_id)
+            nonlocal parsed, parse_failed
+            if status == TaskStatus.SUCCESS and isinstance(payload, StructuredDocument):
+                parsed = payload
             elif status == TaskStatus.FAILURE:
-                self._on_parse_failure(payload if isinstance(payload, str) else str(payload))
+                parse_failed = payload if isinstance(payload, str) else str(payload)
             elif status in (TaskStatus.REVOKED, TaskStatus.CANCELLED):
-                self._on_parse_failure("Parse was cancelled.")
-            self._finish_parse(source)
+                parse_failed = "Parse was cancelled."
 
         try:
-            await self.presenter.parse_document(
+            # Local PDFs load incrementally: convert only the first slice so a
+            # 100+ page document renders instead of timing out, then the TUI
+            # prefetches the rest in the background (see ``_prefetch_batch``).
+            page_range = None
+            if Path(source).suffix.lower() == ".pdf" and Path(source).is_file():
+                page_range = (1, PDF_BATCH_SIZE)
+
+            parse_handle = await self.presenter.parse_document(
                 source=source,
                 domain_id=domain_id,
+                options=options,
+                page_range=page_range,
                 queue=docling_queue,
                 on_progress=on_progress,
                 on_complete=on_complete,
             )
+            # parse_document returns a handle immediately — on_complete fires
+            # asynchronously when the Celery task finishes (Docling can take
+            # minutes), so we must wait for it before reading `parsed`.
+            await parse_handle.wait()
         except Exception as exc:
             self._finish_parse(source)
             self._on_parse_failure(str(exc))
+            return
+
+        if parsed is None:
+            self._finish_parse(source)
+            self._on_parse_failure(parse_failed or "Parse failed.")
+            return
+
+        # --- Domain post-parse: cheap analysis on the doc's agent worker ---
+        payload: dict[str, Any] = {}
+        try:
+            pp_handle = await self.presenter.postprocess_document(
+                domain_id=domain_id,
+                document=parsed,
+                queue=doc_queue,
+            )
+            await pp_handle.wait()
+            if pp_handle.status == TaskStatus.SUCCESS:
+                payload = pp_handle.result or {}
+        except Exception:
+            logger.exception("Post-parse step failed for %s", source)
+
+        if payload:
+            parsed.metadata.update(payload)
+            self._surface_postprocess_info(domain_id, payload)
+
+        self._on_parse_success(parsed, source, domain_id)
+        self._finish_parse(source)
+
+    def _surface_postprocess_info(self, domain_id: str, payload: dict[str, Any]) -> None:
+        """Write parse-time analysis info (SWE: TOC/code/injection/retrieval)."""
+        if domain_id != "swe":
+            return
+        toc = payload.get("toc") or []
+        code_blocks = payload.get("code_blocks") or []
+        source_type = payload.get("source_type", "file")
+        pages = payload.get("pages_converted")
+        chunks = payload.get("chunk_count") or 0
+
+        details = [
+            f"[italic dim]Parsed as {source_type}: {len(toc)} section(s), "
+            f"{len(code_blocks)} code block(s), {chunks} search chunk(s).[/italic dim]"
+        ]
+        if pages:
+            details.append(f"[italic dim]{pages} docs-site pages converted.[/italic dim]")
+        for flag in payload.get("injection_flags") or []:
+            details.append(
+                f"[bold yellow]⚠ Potential prompt-injection text in document: "
+                f"{escape(flag)}[/bold yellow]"
+            )
+        if payload.get("needs_retrieval"):
+            details.append(
+                "[bold yellow]Large document: agent will search sections with the "
+                "retrieval tool instead of reading it whole.[/bold yellow]"
+            )
+        for line in details:
+            self.write_chat_message(line, persist=False)
 
     def _finish_parse(self, source: str) -> None:
         """Drop *source*'s parse handle; clear the parsing flag when done."""
@@ -951,6 +1062,17 @@ class SqwakvoxApp(App[None]):
             structured=structured,
             source=source,
         )
+        # Initialise incremental-paging bookkeeping when the document arrived
+        # as a PDF page slice (controller stamps ``page_range`` on the result).
+        if structured.metadata.get("page_range") is not None:
+            loaded = self.loaded_documents[source]
+            loaded.batch_size = int(structured.metadata.get("pages_in_batch") or PDF_BATCH_SIZE)
+            loaded.total_pages = structured.metadata.get("total_pages")
+            loaded.rendered_pages = loaded.batch_size
+            loaded.next_batch = 1
+            loaded.batch_cache = {}
+            loaded.pending = {}
+
         if structured.file_name not in self.chat_histories:
             saved = self._load_chat_log(structured.file_name)
             self.chat_histories[structured.file_name] = saved
@@ -965,6 +1087,150 @@ class SqwakvoxApp(App[None]):
 
         self._rebuild_tabs()
         self._switch_to_document(structured, source="ingest")
+
+        # Prefetch the next slice in the background so "Load more" is instant.
+        if self.loaded_documents[source].is_paged:
+            self._update_pager(source)
+            self.run_worker(
+                self._prefetch_batch(source, 1),
+                name=f"prefetch_{source}_1",
+            )
+
+    # ------------------------------------------------------------------ #
+    # Incremental PDF paging: render the first slice, prefetch the rest.
+    # ------------------------------------------------------------------ #
+    def _update_pager(self, source: str) -> None:
+        """Enable/disable the "Load more" control and show a page indicator."""
+        try:
+            btn = self.query_one("#btn-load-more", Button)
+            indicator = self.query_one("#page-indicator", Label)
+        except Exception:
+            return
+        loaded = self.loaded_documents.get(source)
+        if loaded is None or not loaded.is_paged:
+            btn.disabled = True
+            indicator.update("")
+            return
+        rendered = loaded.rendered_pages
+        total = loaded.total_pages
+        if total:
+            indicator.update(f"[dim]Pages 1-{rendered} of {total}[/dim]")
+            done = rendered >= total
+        else:
+            indicator.update(f"[dim]Pages 1-{rendered} loaded[/dim]")
+            # Unknown total: stop once the next slice comes back empty.
+            done = (
+                loaded.next_batch in loaded.batch_cache
+                and not (loaded.batch_cache[loaded.next_batch].raw_markdown or "").strip()
+            )
+        btn.disabled = done
+        btn.label = "All pages loaded ✓" if done else "Load more pages ↓"
+
+    async def _prefetch_batch(self, source: str, batch_index: int) -> None:
+        """Fetch PDF page slice *batch_index* in the background and cache it.
+
+        On completion it chains a prefetch of the following slice so the cache
+        stays one slice ahead of what the user has revealed.
+        """
+        loaded = self.loaded_documents.get(source)
+        if loaded is None or not loaded.is_paged:
+            return
+        if batch_index in loaded.pending or batch_index in loaded.batch_cache:
+            return
+        if loaded.total_pages and batch_index * loaded.batch_size >= loaded.total_pages:
+            return
+
+        start = batch_index * loaded.batch_size + 1
+        end = start + loaded.batch_size - 1
+        if loaded.total_pages:
+            end = min(end, loaded.total_pages)
+
+        domain_id = loaded.domain_id
+        docling_queue = self._docling_queue()
+
+        def on_complete(status: TaskStatus, payload: Any) -> None:
+            if status == TaskStatus.SUCCESS and isinstance(payload, StructuredDocument):
+                loaded.batch_cache[batch_index] = payload
+                # Keep one slice ahead: prefetch the next one.
+                self.run_worker(
+                    self._prefetch_batch(source, batch_index + 1),
+                    name=f"prefetch_{source}_{batch_index + 1}",
+                )
+            elif status in (TaskStatus.FAILURE, TaskStatus.REVOKED, TaskStatus.CANCELLED):
+                loaded.pending.pop(batch_index, None)
+
+        try:
+            handle = await self.presenter.parse_document(
+                source=source,
+                domain_id=domain_id,
+                page_range=(start, end),
+                queue=docling_queue,
+                on_complete=on_complete,
+            )
+            loaded.pending[batch_index] = handle
+        except Exception as exc:
+            logger.warning("Prefetch of slice %d for %s failed: %s", batch_index, source, exc)
+
+    async def _load_more(self, source: str) -> None:
+        """Append the next prefetched (or in-flight) PDF slice to the document."""
+        loaded = self.loaded_documents.get(source)
+        if loaded is None or not loaded.is_paged:
+            return
+
+        batch_index = loaded.next_batch
+        if batch_index not in loaded.batch_cache:
+            if batch_index in loaded.pending:
+                await loaded.pending[batch_index].wait()
+            else:
+                start = batch_index * loaded.batch_size + 1
+                end = start + loaded.batch_size - 1
+                if loaded.total_pages:
+                    end = min(end, loaded.total_pages)
+                try:
+                    handle = await self.presenter.parse_document(
+                        source=source,
+                        domain_id=loaded.domain_id,
+                        page_range=(start, end),
+                        queue=self._docling_queue(),
+                    )
+                    await handle.wait()
+                except Exception as exc:
+                    logger.warning("Load-more slice %d failed: %s", batch_index, exc)
+                    return
+                if handle.status == TaskStatus.SUCCESS and isinstance(
+                    handle.result, StructuredDocument
+                ):
+                    loaded.batch_cache[batch_index] = handle.result
+                else:
+                    return
+
+        batch = loaded.batch_cache.pop(batch_index, None)
+        if batch is None:
+            return
+        if not (batch.raw_markdown or "").strip():
+            # Empty slice => end of document (e.g. unknown total_pages).
+            loaded.next_batch = batch_index + 1
+            self._update_pager(source)
+            return
+
+        # Extend the rendered document and refresh the agent context.
+        loaded.structured.raw_markdown += "\n\n" + batch.raw_markdown
+        loaded.structured.tables.extend(batch.tables)
+        loaded.rendered_pages += int(batch.metadata.get("pages_in_batch") or loaded.batch_size)
+        loaded.next_batch = batch_index + 1
+
+        domain_id = loaded.domain_id
+        self.doc_context = get_domain(domain_id).context_for(loaded.structured)
+        render_pane = self.query_one("#render-pane", DocumentRenderPane)
+        render_pane.update_document(loaded.structured, domain_id)
+        self._update_pager(source)
+
+        # Make sure the following slice is already being prefetched.
+        if batch_index + 1 not in loaded.pending and batch_index + 1 not in loaded.batch_cache:
+            self.run_worker(
+                self._prefetch_batch(source, batch_index + 1),
+                name=f"prefetch_{source}_{batch_index + 1}",
+            )
 
     def _on_parse_failure(self, error_message: str) -> None:
         # Note: is_parsing is cleared by _finish_parse once *all* in-flight
@@ -1221,7 +1487,6 @@ class SqwakvoxApp(App[None]):
 
     def _switch_to_document(self, doc: StructuredDocument, source: str) -> None:
         self.structured_doc = doc
-        self.doc_context = doc.raw_markdown
         self.active_document_name = doc.file_name
 
         # Find document source + its domain
@@ -1233,12 +1498,22 @@ class SqwakvoxApp(App[None]):
                 domain_id = loaded.domain_id
                 break
 
+        # The agent context is domain-built (large SWE docs get TOC + first
+        # chunks + search instructions instead of the full raw markdown).
+        self.doc_context = get_domain(domain_id).context_for(doc)
+
+        # Widget lookups can fail during app teardown (e.g. a queued
+        # TabActivated message processed after unmount begins) — tolerate it.
         if doc_source:
-            self.query_one("#doc-source", Input).value = doc_source
+            with contextlib.suppress(Exception):
+                self.query_one("#doc-source", Input).value = doc_source
 
         # Update center rendering pane with the domain's renderer
         render_pane = self.query_one("#render-pane", DocumentRenderPane)
         render_pane.update_document(doc, domain_id)
+
+        # Reflect this document's page-slice state in the pager controls.
+        self._update_pager(doc_source)
 
         # Refresh the skills list for the active domain
         self._refresh_skills_list(domain_id)
@@ -1318,7 +1593,20 @@ class SqwakvoxApp(App[None]):
             source = self.ingestion_history[idx]
             loaded = self.loaded_documents.get(source)
             if loaded and loaded.file_name != self.active_document_name:
-                self._switch_to_document(loaded.structured, source="tab")
+                self._safe_switch(loaded.structured, source="tab")
+
+    def _safe_switch(self, doc: StructuredDocument, source: str) -> None:
+        """Switch documents, tolerating a partially-torn-down DOM.
+
+        A queued ``TabActivated``/selection message can be processed after
+        unmount begins (e.g. a tab activation scheduled during document load);
+        the widget lookups then fail.  Those messages are harmless at that
+        point — log and move on rather than letting them crash the app.
+        """
+        try:
+            self._switch_to_document(doc, source)
+        except Exception:
+            logger.debug("Document switch (%s) ignored during teardown", source, exc_info=True)
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
         if event.list_view.id == "ingest-history" and event.index is not None:
@@ -1327,4 +1615,4 @@ class SqwakvoxApp(App[None]):
                 source = self.ingestion_history[idx]
                 loaded = self.loaded_documents.get(source)
                 if loaded and loaded.file_name != self.active_document_name:
-                    self._switch_to_document(loaded.structured, source="list")
+                    self._safe_switch(loaded.structured, source="list")

@@ -23,12 +23,13 @@ Sqwakvox is a terminal user interface application for **document analysis with m
 
 - **3-Pane TUI**: The interface has a sidebar, a document render pane, and a chat log.
 - **Multiple expert types**: Pick the "Agent Expert Type" when loading a document; each tab keeps its own domain (prompts, guardrails, rendering, tools).
-- **Docling Integration**: The application parses local PDF/EPUB/Markdown files and remote URLs.
+- **Docling Integration**: The application parses local PDF/EPUB/Markdown files and remote URLs, and can **crawl a docs site** (sitemap-aware, same-host, capped) for multi-page library documentation.
 - **Multi-Model Support**: The application connects to OpenAI, Anthropic, Mistral, and Gemini models.
 - **Input Guardrails**: Mozilla `any-guardrail` blocks prompt injection attacks before queries reach the model.
 - **PII Redaction**: The system redacts Social Security numbers, credit cards, bank accounts, and email addresses.
 - **Financial Cross-Validation**: The rule engine extracts numeric table values and verifies calculated results.
 - **SWE skills**: The SWE assistant can create/read/update reusable `SKILL.md` files (YAML frontmatter) under `./skills/swe/<name>/` via its skills MCP tools.
+- **Chunked retrieval**: large SWE documents (Fowler-scale books) are indexed into SQLite FTS5 chunks; the agent searches them via the `retrieval` MCP tool instead of reading the whole book, and the TUI warns about prompt-injection text found in ingested docs.
 - **OpenTelemetry Instrumentation**: The system records traces and metrics for document processing, agent execution, and tool calls.
 - **Unicode Table Rendering**: The application displays double borders, automatic column alignment, and numeric sparklines.
 - **Audit Logging**: The application writes events to an append-only JSONL audit log.
@@ -144,7 +145,7 @@ attached (`domains` tag in `mcp_servers.json`; untagged servers are global):
 | Domain | Sources | Extras |
 |---|---|---|
 | Financial | PDF, tables | math cross-validation, sparklines, calc-stats tools |
-| SWE | PDF, **EPUB**, docs URLs, Markdown | TOC + code-block index, injection scan, secret redaction, **skills** |
+| SWE | PDF, **EPUB**, docs URLs (**crawlable sites**), Markdown | TOC + code-block index, injection scan, secret redaction, **skills**, **chunked retrieval** |
 
 #### SWE skills
 
