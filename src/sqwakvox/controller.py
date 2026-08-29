@@ -69,6 +69,30 @@ def _walk_for_message(obj: object) -> str | None:
     return None
 
 
+def pdf_page_count(source: str) -> int | None:
+    """Cheap total page count for a local PDF via pypdfium2 (no OCR).
+
+    Used to drive incremental page-batch rendering: the TUI loads the first
+    N pages immediately and shows a "Load more" control until every page has
+    been fetched.  Returns ``None`` for non-PDF / remote sources where a quick
+    count isn't available — the UI then falls back to detecting the end of the
+    document when a fetched batch comes back empty.
+    """
+
+    if not source.lower().endswith(".pdf"):
+        return None
+    if not Path(source).is_file():
+        return None
+    try:
+        import pypdfium2 as pdfium
+
+        with pdfium.PdfDocument(source) as pdf:
+            return len(pdf)
+    except Exception as exc:  # counting must never break parsing
+        logger.warning("pdf_page_count failed for %s: %s", source, exc)
+        return None
+
+
 def _unwrap_timeout_cause() -> SoftTimeLimitExceeded | None:
     """Inspect the current exception chain for a wrapped timeout.
 
@@ -141,13 +165,21 @@ class AppController:
         source: str,
         is_cancelled: Callable[[], bool],
         domain_id: str = "financial",
+        page_range: tuple[int, int] | None = None,
     ) -> StructuredDocument | None:
         tm = get_telemetry()
         start_time = time.monotonic()
         with trace_span("sqwakvox.document.convert", {"source": source}) as span:
             logger.info(f"Running Docling layout converter on {source}...")
             try:
-                result = self.converter.convert(source)
+                convert_kwargs: dict[str, Any] = {}
+                if page_range is not None:
+                    # Docling only OCRs/lays-out the requested slice, so a
+                    # 100+ page PDF can be loaded a few pages at a time instead
+                    # of blocking on one monolithic conversion that blows the
+                    # Celery time limit.
+                    convert_kwargs["page_range"] = (int(page_range[0]), int(page_range[1]))
+                result = self.converter.convert(source, **convert_kwargs)
                 if is_cancelled():
                     logger.info("Docling parsing worker was cancelled.")
                     span.set_attribute("cancelled", True)
@@ -214,11 +246,31 @@ class AppController:
                             )
                         )
 
+                total_pages = pdf_page_count(source)
+                if page_range is not None:
+                    start, end = convert_kwargs["page_range"]
+                    # ``result.pages`` holds exactly the converted slice, so its
+                    # length is the authoritative page count for this batch.
+                    pages_in_batch = (
+                        len(result.pages)
+                        if hasattr(result, "pages") and result.pages is not None
+                        else max(0, min(end, total_pages or end) - start + 1)
+                    )
+                else:
+                    pages_in_batch = total_pages
+
                 doc = StructuredDocument(
                     file_name=doc_name,
                     raw_markdown=doc_md,
                     tables=tables,
-                    metadata={"domain_id": domain_id},
+                    metadata={
+                        "domain_id": domain_id,
+                        "page_range": list(convert_kwargs["page_range"])
+                        if page_range is not None
+                        else None,
+                        "total_pages": total_pages,
+                        "pages_in_batch": pages_in_batch,
+                    },
                 )
 
                 duration = time.monotonic() - start_time

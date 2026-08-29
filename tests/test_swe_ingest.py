@@ -124,6 +124,24 @@ def test_ingest_plan_url_single_by_default() -> None:
     assert plan.metadata["source_type"] == "url"
 
 
+def test_ingest_plan_never_auto_crawls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Docs-root-looking URLs stay single-page unless crawl is explicit."""
+    from sqwakvox.domains.swe import crawl as crawl_mod
+
+    def boom(*_args: object, **_kwargs: object) -> list[str]:
+        raise AssertionError("crawl_site must not run without explicit opt-in")
+
+    monkeypatch.setattr(crawl_mod, "crawl_site", boom)
+    for url in (
+        "https://example.com/",
+        "https://docs.example.com",
+        "https://example.com/docs/",
+    ):
+        plan = build_ingest_plan(url)
+        assert plan.kind == "single", url
+        assert plan.metadata["source_type"] == "url", url
+
+
 def test_ingest_plan_force_crawl(monkeypatch: pytest.MonkeyPatch) -> None:
     from sqwakvox.domains.swe import crawl as crawl_mod
 

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from textual.widgets import ListView, Select, Tab, Tabs
 
@@ -108,7 +110,7 @@ async def test_document_load_routes_parse_to_shared_docling_worker(
     """Parsing must route to the *shared* Docling queue and ensure the shared
     docling worker, while each tab still gets its own agent queue/worker."""
     app = SqwakvoxApp()
-    async with app.run_test():
+    async with app.run_test() as pilot:
         ensured: list[str] = []
         monkeypatch.setattr(
             app.worker_manager,
@@ -124,6 +126,7 @@ async def test_document_load_routes_parse_to_shared_docling_worker(
 
         routed1 = _stub_parse(monkeypatch, app, _doc1())
         await app._dispatch_parse("/tmp/doc1.pdf")
+        await pilot.pause()  # flush queued tab-activation messages
 
         # Tab 1 gets its own agent queue AND the shared docling worker is
         # ensured; the parse task itself goes to the docling queue.
@@ -134,6 +137,7 @@ async def test_document_load_routes_parse_to_shared_docling_worker(
 
         routed2 = _stub_parse(monkeypatch, app, _doc2())
         await app._dispatch_parse("/tmp/doc2.pdf")
+        await pilot.pause()  # flush queued tab-activation messages
 
         # Tab 2 gets its own agent queue; the docling worker is shared, so it
         # is only ensured (never re-spawned) — the real WorkerManager treats
@@ -180,7 +184,7 @@ async def test_managed_workers_disabled_falls_back_to_default_queue(
     """SQWAKVOX_MANAGED_WORKERS=0 restores bring-your-own-worker behaviour."""
     monkeypatch.setenv("SQWAKVOX_MANAGED_WORKERS", "0")
     app = SqwakvoxApp()
-    async with app.run_test():
+    async with app.run_test() as pilot:
         ensured: list[str] = []
         docling_ensured: list[bool] = []
         monkeypatch.setattr(
@@ -196,6 +200,7 @@ async def test_managed_workers_disabled_falls_back_to_default_queue(
 
         routed = _stub_parse(monkeypatch, app, _doc1())
         await app._dispatch_parse("/tmp/doc1.pdf")
+        await pilot.pause()  # flush queued tab-activation messages
 
         assert ensured == []  # no per-tab worker spawned
         assert docling_ensured == []  # no shared docling worker spawned
@@ -281,7 +286,7 @@ async def test_parse_flow_merges_postprocess_payload_before_switch(
     be merged into the document's metadata before the tab switches, so the
     renderer/agent context see the full picture."""
     app = SqwakvoxApp()
-    async with app.run_test():
+    async with app.run_test() as pilot:
         monkeypatch.setattr(app.worker_manager, "ensure_worker", lambda _queue, **_k: True)
         monkeypatch.setattr(app.worker_manager, "ensure_docling_worker", lambda: True)
 
@@ -312,6 +317,7 @@ async def test_parse_flow_merges_postprocess_payload_before_switch(
         monkeypatch.setattr(app.presenter, "postprocess_document", fake_postprocess)
 
         await app._dispatch_parse("/tmp/book.epub", "swe")
+        await pilot.pause()  # flush queued tab-activation messages
 
         # Payload merged into the stored document's metadata.
         loaded = app.loaded_documents["/tmp/book.epub"]
@@ -319,3 +325,50 @@ async def test_parse_flow_merges_postprocess_payload_before_switch(
         assert loaded.structured.metadata["injection_flags"] == ["ignore previous instructions"]
         # Tab switched.
         assert app.active_document_name == "doc1.pdf"
+
+
+@pytest.mark.asyncio
+async def test_dispatch_parse_waits_for_async_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: the real presenter fires on_complete *after* parse_document
+    returns (async polling).  _dispatch_parse must wait for the handle and
+    only then switch tabs — it must not report "Parse failed" immediately."""
+    app = SqwakvoxApp()
+    async with app.run_test() as pilot:
+        monkeypatch.setattr(app.worker_manager, "ensure_worker", lambda _queue, **_k: True)
+        monkeypatch.setattr(app.worker_manager, "ensure_docling_worker", lambda: True)
+        _stub_postprocess(monkeypatch, app)
+
+        class DelayedHandle:
+            status = TaskStatus.PENDING
+
+            def __init__(self, event: asyncio.Event) -> None:
+                self._event = event
+
+            async def wait(self, _timeout: float | None = None) -> TaskStatus:
+                await self._event.wait()
+                return self.status
+
+        event = asyncio.Event()
+        pending_tasks: list[asyncio.Task[None]] = []
+
+        async def fake_parse(**_kwargs):
+            async def _complete() -> None:
+                await asyncio.sleep(0.05)  # mimic async poll resolution
+                _kwargs["on_complete"](TaskStatus.SUCCESS, _doc1())
+                event.set()
+
+            pending_tasks.append(asyncio.ensure_future(_complete()))
+            return DelayedHandle(event)
+
+        monkeypatch.setattr(app.presenter, "parse_document", fake_parse)
+
+        await app._dispatch_parse("/tmp/late.pdf", "swe")
+        await pilot.pause()  # flush queued tab-activation messages
+
+        # The document only lands after the delayed completion — no premature
+        # failure, no "Parse failed." path.
+        assert app.active_document_name == "doc1.pdf"
+        assert app.active_error is None
+        assert app.loaded_documents["/tmp/late.pdf"].file_name == "doc1.pdf"

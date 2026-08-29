@@ -143,12 +143,35 @@ class LoadedDocument:
     """View-side wrapper: a parsed document plus the domain that parsed it.
 
     Lets a single TUI session hold tabs from *different* domains at once.
+
+    When the document was loaded as PDF page batches (see
+    :meth:`~sqwakvox.app.SqwakvoxApp._prefetch_batch`), the paging fields
+    track which slices have been fetched and rendered so the TUI can show a
+    "Load more" control and prefetch the next slice in the background.
     """
 
     domain_id: str
     structured: StructuredDocument
     source: str
+    #: Pages in each fetched slice (the first slice is ``structured`` itself).
+    batch_size: int = 0
+    #: Total pages of the source PDF, or ``None`` when unknown (then the end is
+    #: detected when a fetched slice comes back empty).
+    total_pages: int | None = None
+    #: Highest 1-based page currently rendered (``batch_size`` after slice 0).
+    rendered_pages: int = 0
+    #: Next slice index to load (0 is the initial parse result).
+    next_batch: int = 0
+    #: Prefetched slices awaiting display, keyed by slice index.
+    batch_cache: dict[int, StructuredDocument] = field(default_factory=dict)
+    #: In-flight prefetch task handles, keyed by slice index.
+    pending: dict[int, Any] = field(default_factory=dict)
 
     @property
     def file_name(self) -> str:
         return self.structured.file_name
+
+    @property
+    def is_paged(self) -> bool:
+        """True when this document was loaded page-slice by page-slice."""
+        return self.batch_size > 0

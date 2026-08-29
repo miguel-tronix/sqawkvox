@@ -61,11 +61,14 @@ def convert_document(
     source: str,
     domain_id: str = "financial",
     options: dict[str, Any] | None = None,
+    page_range: tuple[int, int] | None = None,
 ) -> dict[str, Any] | None:
     """Parse *source* (path/URL) into a :class:`StructuredDocument`.
 
     The domain's ingest plan decides how Docling is fed (EPUB chapters,
-    single PDF/URL, ...) and how the result is reassembled.  Returns the
+    single PDF/URL, ...) and how the result is reassembled.  ``page_range``
+    (1-based ``[start, end]``) restricts the conversion to a slice of a PDF so
+    large documents load incrementally instead of timing out.  Returns the
     document as a plain dict (``model_dump``), or ``None`` if the worker was
     revoked.
     """
@@ -89,9 +92,11 @@ def convert_document(
     )
     convert_fn = domain.convert
     doc = (
-        controller.convert_document(source, is_cancelled, domain_id=domain_id)
+        controller.convert_document(
+            source, is_cancelled, domain_id=domain_id, page_range=page_range
+        )
         if convert_fn is None
-        else convert_fn(controller, source, plan, is_cancelled)
+        else convert_fn(controller, source, plan, is_cancelled, page_range=page_range)
     )
     if doc is None:
         return None

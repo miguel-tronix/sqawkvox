@@ -27,6 +27,10 @@ from sqwakvox.models import StructuredDocument
 
 logger = logging.getLogger(__name__)
 
+#: Default max pages for PDFs — docs beyond this limit will have
+#: ``needs_retrieval`` set so the agent uses the retrieval tool.
+PDF_MAX_PAGES = 50
+
 #: Above this size the raw markdown no longer fits a single agent context;
 #: the agent gets TOC + first chunks and must use the retrieval tool.
 MAX_CONTEXT_CHARS = 100_000
@@ -42,8 +46,10 @@ SITE_PAGE_DELAY = 0.2
 def build_ingest_plan(source: str, options: dict[str, Any] | None = None) -> IngestPlan:
     """Classify *source* into an ingest plan for the shared docling worker.
 
-    ``options`` may carry ``crawl`` (True = force docs-site crawl, False =
-    single page, omitted = auto-detect via the URL shape) and ``max_pages``.
+    ``options`` may carry ``crawl`` (True = docs-site crawl, False/omitted =
+    single page) and ``max_pages``.  Crawling is strictly opt-in — never
+    auto-triggered — so loading a URL is always a single-page fetch unless
+    the user explicitly checks "Crawl docs site".
     """
     options = options or {}
     path = Path(source)
@@ -51,8 +57,7 @@ def build_ingest_plan(source: str, options: dict[str, Any] | None = None) -> Ing
     if suffix == ".epub":
         return IngestPlan(kind="epub", inputs=[source], metadata={"source_type": "epub"})
     if source.startswith(("http://", "https://")):
-        crawl = options.get("crawl")
-        if crawl is not False and (crawl is True or _looks_like_docs_root(source)):
+        if options.get("crawl") is True:
             from sqwakvox.domains.swe.crawl import DEFAULT_MAX_PAGES, crawl_site
 
             pages = crawl_site(
@@ -66,17 +71,21 @@ def build_ingest_plan(source: str, options: dict[str, Any] | None = None) -> Ing
                 )
             # Crawl found a single page — fall through to a plain URL load.
         return IngestPlan(kind="single", inputs=[source], metadata={"source_type": "url"})
-    if suffix in (".pdf", ".md", ".txt", ".html", ".markdown"):
+    if suffix == ".pdf":
+        max_pages = int(options.get("max_pages", PDF_MAX_PAGES))
+        return IngestPlan(
+            kind="single",
+            inputs=[source],
+            metadata={
+                "source_type": "pdf",
+                "max_pages": max_pages,
+            },
+        )
+    if suffix in (".md", ".txt", ".html", ".markdown"):
         return IngestPlan(
             kind="single", inputs=[source], metadata={"source_type": suffix.lstrip(".")}
         )
     return IngestPlan(kind="single", inputs=[source], metadata={"source_type": "file"})
-
-
-def _looks_like_docs_root(source: str) -> bool:
-    from sqwakvox.domains.swe.crawl import looks_like_docs_root as _looks
-
-    return _looks(source)
 
 
 def convert(
@@ -84,13 +93,20 @@ def convert(
     source: str,
     plan: IngestPlan,
     is_cancelled: Any,
+    page_range: tuple[int, int] | None = None,
 ) -> StructuredDocument | None:
-    """Run the SWE conversion for *plan* inside the shared docling worker."""
+    """Run the SWE conversion for *plan* inside the shared docling worker.
+
+    ``page_range`` is forwarded to the PDF path so large documents load a
+    slice at a time (the TUI then fetches further slices on demand).
+    """
     if plan.kind == "epub":
         return _convert_epub(controller, source, is_cancelled)
     if plan.kind == "site":
         return _convert_site(controller, source, plan, is_cancelled)
-    doc = controller.convert_document(source, is_cancelled, domain_id="swe")
+    doc = controller.convert_document(
+        source, is_cancelled, domain_id="swe", page_range=page_range
+    )
     doc = doc if isinstance(doc, StructuredDocument) else None
     if doc is not None:
         doc.metadata.update(plan.metadata)
